@@ -2018,15 +2018,24 @@ struct VDriveHomeView: View {
     }
 
     private func localFilesMatchKey(_ candidateKey: SymmetricKey) async -> Bool {
-        let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
+        let candidateData = candidateKey.withUnsafeBytes { Data($0) }
+        if let storedKey = VDriveCrypto.existingLocalKeyData() {
+            if storedKey == candidateData { return true }
+        } else {
+            // A fresh installation has no local proof to compare; the private
+            // Google Drive appData key copy is the recovery source.
+            let hasLocalFiles = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
+                .contains { $0.pathExtension == "vdrive" }
+            if !hasLocalFiles { return true }
+        }
+
+        let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey])) ?? [])
             .filter { $0.pathExtension == "vdrive" }
-        let currentKey = try? VDriveCrypto.localKey()
-        let keychainMatches = currentKey.map { current in
-            current.withUnsafeBytes { Data($0) } == candidateKey.withUnsafeBytes { Data($0) }
-        } ?? false
-        if keychainMatches { return true }
+        let plainPaths = Set(localURLs.filter { isClearlyPlaintextFile($0) }.map { $0.path })
         return await Task.detached(priority: .utility) { () -> Bool in
-            for url in localURLs {
+            for url in localURLs where !plainPaths.contains(url.path) {
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard size <= 256 * 1024 * 1024 else { return false }
                 let matches = autoreleasepool { () -> Bool in
                     do {
                         let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -2036,7 +2045,9 @@ struct VDriveHomeView: View {
                 }
                 if !matches { return false }
             }
-            return true
+            // Existing Keychain key mismatch plus only plaintext local files is not
+            // enough evidence to replace the key when switching Google accounts.
+            return VDriveCrypto.existingLocalKeyData() == nil || VDriveCrypto.existingLocalKeyData() == candidateData
         }.value
     }
 
