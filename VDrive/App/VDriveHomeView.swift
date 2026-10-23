@@ -1303,6 +1303,7 @@ struct VDriveHomeView: View {
                         try FileManager.default.copyItem(at: transferred.url, to: url)
                         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
                     }.value
+                    VDriveCrypto.markLocalPlaintextFile(url)
                     if let jpeg = await Task.detached(priority: .utility, operation: {
                         VaultThumbnail.makeJPEGThumbnail(fromFileURL: url, filename: "media." + ext)
                     }).value {
@@ -1415,6 +1416,7 @@ struct VDriveHomeView: View {
                     try await Task.detached(priority: .utility) {
                         try self.copyImportedFile(from: sourceURL, to: destination)
                     }.value
+                    VDriveCrypto.markLocalPlaintextFile(destination)
                 } catch {
                     skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
                     continue
@@ -1540,6 +1542,7 @@ struct VDriveHomeView: View {
     }
 
     private func isClearlyPlaintextFile(_ url: URL, filename: String? = nil) -> Bool {
+        if VDriveCrypto.isMarkedLocalPlaintextFile(url) { return true }
         let name = filename ?? VaultFile(id: url.lastPathComponent, url: url).displayName
         let ext = (name as NSString).pathExtension.lowercased()
         guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
@@ -1596,6 +1599,7 @@ struct VDriveHomeView: View {
                 }.value
                 if FileManager.default.fileExists(atPath: staging.path) {
                     _ = try FileManager.default.replaceItemAt(url, withItemAt: staging)
+                    VDriveCrypto.markLocalPlaintextFile(url)
                     migrated += 1
                 }
             } catch {
@@ -1817,6 +1821,7 @@ struct VDriveHomeView: View {
         do {
             guard file.isLocal else { message = "Файл хранится только в Google Drive."; return }
             try FileManager.default.removeItem(at: file.url)
+            VDriveCrypto.unmarkLocalPlaintextFile(file.url)
             VaultThumbnail.removeLocalThumbnail(for: file.id)
             refreshFiles()
             message = file.uploaded ? "Удалено с устройства. Копия в Google Drive сохранена." : "Файл удалён с устройства."
@@ -1836,7 +1841,10 @@ struct VDriveHomeView: View {
         if file.uploaded && !cloudVaultUnlocked { message = "Нельзя менять облако до ввода кода восстановления."; return }
         do {
             if file.uploaded { try await GoogleDriveStore.shared.delete(id: file.id) }
-            if file.isLocal { try? FileManager.default.removeItem(at: file.url) }
+            if file.isLocal {
+                try? FileManager.default.removeItem(at: file.url)
+                VDriveCrypto.unmarkLocalPlaintextFile(file.url)
+            }
             VaultThumbnail.removeLocalThumbnail(for: file.id)
             refreshFiles()
             message = "Файл удалён с устройства и из Google Drive."
