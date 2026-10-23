@@ -1540,46 +1540,44 @@ struct VDriveHomeView: View {
             return
         }
 
+        let fileURL = file.url
+        let displayName = file.displayName
+        let addedDate = file.addedDate
+        let captureDate = file.captureDate
         do {
             let details = try await Task.detached(priority: .utility) { () throws -> String in
-                let stored = try Data(contentsOf: file.url, options: [.mappedIfSafe])
-                let key = try VDriveCrypto.localKey()
-                let plain = (try? VDriveCrypto.open(stored, key: key)) ?? stored
-                let ext = (file.displayName as NSString).pathExtension.lowercased()
-                let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
+                let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
+                let bytes = Int64(values.fileSize ?? 0)
                 let formatter = ByteCountFormatter()
                 formatter.countStyle = .file
-                let size = formatter.string(fromByteCount: Int64(plain.count))
-                let added = file.addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: file.addedDate, dateStyle: .medium, timeStyle: .short)
-                let captured = file.captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .short) } ?? "Не сохранена"
+                let ext = (displayName as NSString).pathExtension.lowercased()
+                let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
+                let added = addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: addedDate, dateStyle: .medium, timeStyle: .short)
+                let captured = captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .short) } ?? "Не сохранена"
                 var lines = [
-                    "Имя: \(file.displayName)",
+                    "Имя: \(displayName)",
                     "Тип: \(type)",
-                    "Размер файла: \(size) (\(plain.count) байт)",
+                    "Размер файла: \(formatter.string(fromByteCount: bytes)) (\(bytes) байт)",
                     "Дата добавления: \(added)",
-                    "Дата съёмки / создания: \(captured)",
-                    "Расположение: iPhone"
+                    "Дата съёмки / создания: \(captured)"
                 ]
                 if ["mov", "mp4", "m4v", "avi", "mkv", "3gp"].contains(ext) {
-                    let temp = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("vdrive-properties-\(UUID().uuidString).\(ext)")
-                    defer { try? FileManager.default.removeItem(at: temp) }
-                    try plain.write(to: temp, options: [.atomic, .completeFileProtection])
-                    let asset = AVURLAsset(url: temp)
+                    let asset = AVURLAsset(url: fileURL)
                     let seconds = asset.duration.seconds
                     if seconds.isFinite && seconds >= 0 {
                         let total = Int(seconds.rounded())
                         lines.append(String(format: "Длительность видео: %d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60))
-                    } else {
-                        lines.append("Длительность видео: не удалось определить")
                     }
                     if let track = asset.tracks(withMediaType: .video).first {
                         let size = track.naturalSize.applying(track.preferredTransform)
                         lines.append("Разрешение: \(Int(abs(size.width))) × \(Int(abs(size.height)))")
                     }
                 } else if ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tiff", "bmp"].contains(ext),
-                          let image = UIImage(data: plain) {
-                    lines.append("Разрешение: \(Int(image.size.width * image.scale)) × \(Int(image.size.height * image.scale))")
+                          let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+                          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                          let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+                          let height = properties[kCGImagePropertyPixelHeight] as? NSNumber {
+                    lines.append("Разрешение: \(width.intValue) × \(height.intValue)")
                 }
                 return lines.joined(separator: "\n")
             }.value
@@ -1602,8 +1600,19 @@ struct VDriveHomeView: View {
         if ["jpg", "jpeg"].contains(ext) { return bytes.starts(with: [0xFF, 0xD8, 0xFF]) }
         if ext == "png" { return bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) }
         if ext == "gif" { return bytes.starts(with: Data("GIF8".utf8)) }
-        if ["mp4", "mov", "m4v", "3gp"].contains(ext) {
-            return bytes.count >= 8 && String(data: bytes[4..<8], encoding: .ascii) == "ftyp"
+        if ["mp4", "mov", "m4v", "3gp", "heic", "heif"].contains(ext) {
+            if bytes.count >= 8, String(data: bytes[4..<8], encoding: .ascii) == "ftyp" {
+                return true
+            }
+            if ["heic", "heif"].contains(ext), bytes.count >= 12 {
+                let brand = String(data: bytes[8..<12], encoding: .ascii) ?? ""
+                return ["heic", "heix", "hevc", "mif1", "msf1"].contains(brand)
+            }
+        }
+        if ext == "avi" { return bytes.starts(with: Data("RIFF".utf8)) }
+        if ext == "mkv" { return bytes.starts(with: [0x1A, 0x45, 0xDF, 0xA3]) }
+        if ["tif", "tiff"].contains(ext) {
+            return bytes.starts(with: [0x49, 0x49, 0x2A, 0x00]) || bytes.starts(with: [0x4D, 0x4D, 0x00, 0x2A])
         }
         if ext == "pdf" { return bytes.starts(with: Data("%PDF".utf8)) }
         if ["zip", "docx", "xlsx", "pptx", "odt", "ods", "odp"].contains(ext) {
