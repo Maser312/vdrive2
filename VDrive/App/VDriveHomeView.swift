@@ -140,17 +140,19 @@ private struct VaultThumbnail: View {
         let cacheURL = Self.localThumbnailURL(for: file.id)
 
         // Cached previews are encrypted at rest. Only decrypt the tiny JPEG, off the main thread.
-        if let encryptedPreview = try? Data(contentsOf: cacheURL, options: [.mappedIfSafe]) {
+        if let cachedPreview = try? Data(contentsOf: cacheURL, options: [.mappedIfSafe]) {
+            if let cachedImage = UIImage(data: cachedPreview) {
+                image = cachedImage
+                return
+            }
             do {
                 let key = try VDriveCrypto.localKey()
                 let jpeg = try await Task.detached(priority: .utility) {
-                    try await ThumbnailCryptoQueue.shared.decrypt(encryptedPreview, key: key)
+                    try await ThumbnailCryptoQueue.shared.decrypt(cachedPreview, key: key)
                 }.value
                 image = UIImage(data: jpeg)
                 if image != nil { return }
-            } catch {
-                // A legacy plaintext cache or an unreadable cache is handled below.
-            }
+            } catch { }
         }
 
         // Migrate previews created by the previous version, then remove the plaintext copy.
@@ -176,8 +178,8 @@ private struct VaultThumbnail: View {
             let name = file.displayName
             do {
                 let jpeg = try await Task.detached(priority: .utility) { () throws -> Data? in
-                    let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
-                    let plain = try VDriveCrypto.open(encrypted, key: VDriveCrypto.localKey())
+                    let fileData = try Data(contentsOf: url, options: [.mappedIfSafe])
+                    let plain = (try? VDriveCrypto.open(fileData, key: VDriveCrypto.localKey())) ?? fileData
                     return Self.makeJPEGThumbnail(from: plain, filename: name)
                 }.value
                 if let jpeg {
@@ -209,7 +211,7 @@ private struct VaultThumbnail: View {
         let jpeg = try await Task.detached(priority: .utility) {
             try await ThumbnailCryptoQueue.shared.decrypt(encryptedPreview, key: key)
         }.value
-        try? Self.saveEncryptedThumbnail(encryptedPreview, for: file.id)
+        try? Self.saveLocalThumbnail(jpeg, for: file.id)
         return UIImage(data: jpeg)
     }
 
@@ -227,9 +229,13 @@ private struct VaultThumbnail: View {
     }
 
     static func saveLocalThumbnail(_ jpeg: Data, for fileID: String) throws {
-        let key = try VDriveCrypto.localKey()
-        let encrypted = try VDriveCrypto.seal(jpeg, key: key)
-        try saveEncryptedThumbnail(encrypted, for: fileID)
+        let directory = thumbnailDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = directory
+        try? mutableURL.setResourceValues(values)
+        try jpeg.write(to: localThumbnailURL(for: fileID), options: [.atomic, .completeFileProtection])
     }
 
     static func saveEncryptedThumbnail(_ encrypted: Data, for fileID: String) throws {
@@ -1022,7 +1028,7 @@ struct VDriveHomeView: View {
         defer { busy = false; refreshFiles() }
         do {
             for file in targets {
-                try await GoogleDriveStore.shared.upload(file.url)
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
                 if let thumb = try makeEncryptedThumbnail(for: file.url) {
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
                 }
@@ -1040,7 +1046,7 @@ struct VDriveHomeView: View {
         do {
             for file in targets {
                 guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { continue }
-                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL())
+                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey())
             }
             await refreshCloudInventory()
             message = "Выбранные файлы скачаны."
@@ -1211,7 +1217,6 @@ struct VDriveHomeView: View {
         var assetIDs: [String] = []
         var failures: [String] = []
         do {
-            let key = try VDriveCrypto.localKey()
             for (index, item) in items.enumerated() {
                 transferProgress = index
                 transferLabel = "Читаю фото или видео: \(index + 1) из \(items.count)"
@@ -1223,7 +1228,6 @@ struct VDriveHomeView: View {
                     }
                     transferLabel = "Шифрую и сохраняю: \(index + 1) из \(items.count)"
                     message = transferLabel
-                    let sealed = try VDriveCrypto.seal(raw, key: key)
                     let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "bin"
                     let addedTimestamp = Date().timeIntervalSince1970
                     let captureDate: Date? = item.itemIdentifier.flatMap { identifier in
@@ -1233,7 +1237,7 @@ struct VDriveHomeView: View {
                     let name = UUID().uuidString + "__A" + String(Int(addedTimestamp)) +
                         "__C" + String(Int(captureTimestamp)) + "__media." + ext + ".vdrive"
                     let url = documentsURL().appendingPathComponent(name)
-                    try sealed.write(to: url, options: [.atomic, .completeFileProtection])
+                    try raw.write(to: url, options: [.atomic, .completeFileProtection])
                     if let jpeg = await Task.detached(priority: .utility, operation: {
                         VaultThumbnail.makeJPEGThumbnail(from: raw, filename: "media." + ext)
                     }).value {
@@ -1331,7 +1335,6 @@ struct VDriveHomeView: View {
         message = "Импортирую выбранные файлы…"
         defer { busy = false }
         do {
-            let key = try VDriveCrypto.localKey()
             var added = 0
             var skipped: [String] = []
             for sourceURL in urls {
@@ -1351,8 +1354,7 @@ struct VDriveHomeView: View {
                 let name = UUID().uuidString + "__A" + String(format: "%.3f", addedTimestamp) +
                     "__C" + String(format: "%.3f", captureTimestamp) + "__" + safeName + ".vdrive"
                 let destination = documentsURL().appendingPathComponent(name)
-                let sealed = try VDriveCrypto.seal(raw, key: key)
-                try sealed.write(to: destination, options: [.atomic, .completeFileProtection])
+                try raw.write(to: destination, options: [.atomic, .completeFileProtection])
                 if let jpeg = await Task.detached(priority: .utility, operation: {
                     VaultThumbnail.makeJPEGThumbnail(from: raw, filename: safeName)
                 }).value {
@@ -1414,9 +1416,7 @@ struct VDriveHomeView: View {
     }
 
     private func makeEncryptedThumbnail(for encryptedFile: URL) throws -> Data? {
-        let key = try VDriveCrypto.localKey()
-        let sealed = try Data(contentsOf: encryptedFile)
-        let original = try VDriveCrypto.open(sealed, key: key)
+        let original = try Data(contentsOf: encryptedFile, options: [.mappedIfSafe])
         let rawName = encryptedFile.deletingPathExtension().lastPathComponent
         let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
         let ext = (mediaName as NSString).pathExtension.lowercased()
@@ -1536,8 +1536,8 @@ struct VDriveHomeView: View {
     }
 
     private func decryptedTemporaryURL(for file: VaultFile) throws -> URL {
-        let encrypted = try Data(contentsOf: file.url)
-        let plain = try VDriveCrypto.open(encrypted, key: VDriveCrypto.localKey())
+        let stored = try Data(contentsOf: file.url, options: [.mappedIfSafe])
+        let plain = (try? VDriveCrypto.open(stored, key: VDriveCrypto.localKey())) ?? stored
         let rawName = file.url.deletingPathExtension().lastPathComponent
         let pieces = rawName.components(separatedBy: "__")
         let originalName = pieces.count > 1 ? pieces.dropFirst().joined(separator: "__") : rawName
@@ -1553,7 +1553,7 @@ struct VDriveHomeView: View {
         guard file.isLocal else { Task { await downloadAndOpen(file) }; return }
         do {
             let currentFiles = sortedFiles.filter { $0.isLocal }
-            let urls = try currentFiles.map { try decryptedTemporaryURL(for: $0) }
+            let urls = currentFiles.map { $0.url }
             let items = zip(currentFiles, urls).enumerated().map { index, pair in
                 PreviewItem(id: index, name: pair.0.displayName, url: pair.1)
             }
@@ -1561,7 +1561,7 @@ struct VDriveHomeView: View {
                 message = "Хранилище ещё загружается. Попробуйте снова."
                 return
             }
-            previewURLs = urls
+            previewURLs = []
             previewIndex = currentFiles.firstIndex(of: file) ?? 0
             previewPresentation = PreviewPresentation(items: items, initialIndex: previewIndex)
         } catch {
@@ -1650,7 +1650,7 @@ struct VDriveHomeView: View {
             transferTotal = 0
         }
         do {
-            try await GoogleDriveStore.shared.upload(file.url)
+            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
             if let thumb = try makeEncryptedThumbnail(for: file.url) {
@@ -1676,7 +1676,7 @@ struct VDriveHomeView: View {
             transferTotal = 0
         }
         do {
-            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL())
+            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey())
             transferProgress = 1
             refreshFiles()
             message = "Файл скачан на устройство."
@@ -1737,7 +1737,7 @@ struct VDriveHomeView: View {
         do {
             for (index, file) in pending.enumerated() {
                 transferLabel = "Выгружаю медиа: \(index + 1) из \(pending.count)"
-                try await GoogleDriveStore.shared.upload(file.url)
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
                 transferLabel = "Выгружено \(index + 1) из \(pending.count). Создаю миниатюру в фоне…"
                 let thumb = try await Task.detached(priority: .utility) {
                     try makeEncryptedThumbnail(for: file.url)
@@ -1768,7 +1768,7 @@ struct VDriveHomeView: View {
         }
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames)
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())
             transferProgress = count
             transferTotal = max(count, 1)
             transferLabel = "Загрузка из Google Drive завершена"
