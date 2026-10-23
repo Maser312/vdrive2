@@ -1128,7 +1128,7 @@ struct VDriveHomeView: View {
     }
 
     private var displayedVaultKey: String {
-        (try? VDriveCrypto.localKeyData().base64EncodedString()) ?? "Ключ недоступен"
+        VDriveCrypto.existingLocalKeyData()?.base64EncodedString() ?? "Подключи Google Drive или добавь первый файл, чтобы создать ключ"
     }
 
     private var settingsSheet: some View {
@@ -1552,7 +1552,8 @@ struct VDriveHomeView: View {
     }
 
     @MainActor private func migrateLegacyLocalFiles() async {
-        guard let key = try? VDriveCrypto.localKey() else { return }
+        guard let keyData = VDriveCrypto.existingLocalKeyData() else { return }
+        let key = SymmetricKey(data: keyData)
         let urls = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey])) ?? [])
             .filter { $0.pathExtension == "vdrive" }
         var migrated = 0
