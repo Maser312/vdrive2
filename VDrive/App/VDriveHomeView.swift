@@ -785,7 +785,7 @@ struct VDriveHomeView: View {
                 Spacer()
                 HStack(spacing: 7) {
                     Image(systemName: "checkmark.shield.fill")
-                    Text("Ваши данные остаются зашифрованными")
+                    Text("Облачные копии шифруются; локальные файлы защищены iOS")
                 }
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.white.opacity(0.42))
@@ -842,7 +842,7 @@ struct VDriveHomeView: View {
                             ContentUnavailableView(
                                 "Хранилище пусто",
                                 systemImage: "lock.doc",
-                                description: Text("Добавьте фото или видео — они будут зашифрованы на устройстве.")
+                                description: Text("Добавьте фото или видео. На iPhone они хранятся открытыми для быстрого просмотра, в Google Drive — зашифрованными.")
                             )
                             .padding(.top, 24)
                         } else {
@@ -1348,7 +1348,7 @@ struct VDriveHomeView: View {
                 return
             }
 
-            message = "Зашифровано и сохранено на iPhone: \(added)." +
+            message = "Сохранено на iPhone: \(added)." +
                 (failures.isEmpty ? "" : " Не удалось импортировать: \(failures.count).")
             pendingPhotoAssetIDs = assetIDs
             pendingCloudSync = isConnected
@@ -1388,7 +1388,7 @@ struct VDriveHomeView: View {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
             guard status == .authorized || status == .limited else {
                 Task { @MainActor in
-                    message = "VDrive сохранил зашифрованные копии, но iOS не разрешила удалить оригиналы из Фото."
+                    message = "VDrive сохранил копии на устройстве, но iOS не разрешила удалить оригиналы из Фото."
                     finishLocalImportAndSync()
                 }
                 return
