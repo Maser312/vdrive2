@@ -137,6 +137,124 @@ enum VDriveCrypto {
     }
 }
 
+
+    // Chunked authenticated file format. Keeps peak memory bounded to one chunk
+    // instead of loading large videos into RAM. Legacy AES-GCM blobs remain readable.
+    private static let fileMagic = Data("VDRCHNK1".utf8)
+    private static let defaultFileChunkSize = 1_048_576
+
+    static func encryptFile(at source: URL, to destination: URL, key: SymmetricKey) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: source.path)
+        let total = UInt64((attributes[.size] as? NSNumber)?.uint64Value ?? 0)
+        let chunkSize = UInt32(defaultFileChunkSize)
+        var header = fileMagic
+        header.appendBigEndian(total)
+        header.appendBigEndian(chunkSize)
+
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let input = try FileHandle(forReadingFrom: source)
+        let output = try FileHandle(forWritingTo: destination)
+        defer { try? input.close(); try? output.close() }
+        try output.write(contentsOf: header)
+
+        var remaining = total
+        var index: UInt64 = 0
+        while remaining > 0 {
+            let count = Int(min(remaining, UInt64(chunkSize)))
+            let plaintext = try readExactly(count, from: input)
+            var aad = header
+            aad.appendBigEndian(index)
+            let sealed = try AES.GCM.seal(plaintext, using: key, authenticating: aad)
+            guard let combined = sealed.combined else { throw CocoaError(.fileWriteUnknown) }
+            try output.write(contentsOf: combined)
+            remaining -= UInt64(count)
+            index += 1
+        }
+        try output.synchronize()
+    }
+
+    static func decryptFile(at source: URL, to destination: URL, key: SymmetricKey) throws {
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        let first = try readExactly(fileMagic.count, from: input)
+        guard first == fileMagic else {
+            // Older VDrive versions encrypted the complete file as one AES-GCM box.
+            // This compatibility path is intentionally isolated; new uploads use chunks.
+            let legacy = try Data(contentsOf: source, options: [.mappedIfSafe])
+            let plaintext = try open(legacy, key: key)
+            try plaintext.write(to: destination, options: [.atomic, .completeFileProtection])
+            return
+        }
+
+        let rest = try readExactly(12, from: input)
+        var header = first
+        header.append(rest)
+        let total = rest.readBigEndianUInt64(at: 0)
+        let chunkSize = rest.readBigEndianUInt32(at: 8)
+        guard chunkSize >= 65_536, chunkSize <= 4_194_304 else {
+            throw cryptoError(-1, "Формат облачного файла повреждён.")
+        }
+
+        let parent = destination.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let staging = parent.appendingPathComponent(".vdrive-decrypt-\(UUID().uuidString).tmp")
+        guard FileManager.default.createFile(atPath: staging.path, contents: nil) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        do {
+            let output = try FileHandle(forWritingTo: staging)
+            defer { try? output.close() }
+            var remaining = total
+            var index: UInt64 = 0
+            while remaining > 0 {
+                let plainCount = Int(min(remaining, UInt64(chunkSize)))
+                let sealedCount = plainCount + 28
+                let combined = try readExactly(sealedCount, from: input)
+                let box = try AES.GCM.SealedBox(combined: combined)
+                var aad = header
+                aad.appendBigEndian(index)
+                let plaintext = try AES.GCM.open(box, using: key, authenticating: aad)
+                guard plaintext.count == plainCount else {
+                    throw cryptoError(-1, "Размер блока облачного файла не совпадает.")
+                }
+                try output.write(contentsOf: plaintext)
+                remaining -= UInt64(plainCount)
+                index += 1
+            }
+            guard try input.read(upToCount: 1) == nil else {
+                throw cryptoError(-1, "В облачном файле обнаружены лишние данные.")
+            }
+            try output.synchronize()
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
+            } else {
+                try FileManager.default.moveItem(at: staging, to: destination)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            throw error
+        }
+    }
+
+    private static func readExactly(_ count: Int, from handle: FileHandle) throws -> Data {
+        var result = Data()
+        result.reserveCapacity(count)
+        while result.count < count {
+            guard let part = try handle.read(upToCount: count - result.count), !part.isEmpty else {
+                throw cryptoError(-1, "Файл оборван или повреждён.")
+            }
+            result.append(part)
+        }
+        return result
+    }
+
 private extension Data {
     func base64URLEncodedString() -> String {
         base64EncodedString()
