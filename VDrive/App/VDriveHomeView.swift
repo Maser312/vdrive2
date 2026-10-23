@@ -1073,7 +1073,7 @@ struct VDriveHomeView: View {
         do {
             for file in targets {
                 try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
-                if let thumb = try makeEncryptedThumbnail(for: file.url) {
+                if let thumb = try self.makeEncryptedThumbnail(for: file.url) {
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
                 }
             }
@@ -1413,7 +1413,7 @@ struct VDriveHomeView: View {
                 let destination = documentsURL().appendingPathComponent(name)
                 do {
                     try await Task.detached(priority: .utility) {
-                        try copyImportedFile(from: sourceURL, to: destination)
+                        try self.copyImportedFile(from: sourceURL, to: destination)
                     }.value
                 } catch {
                     skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
@@ -1774,7 +1774,7 @@ struct VDriveHomeView: View {
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
             let thumb = try await Task.detached(priority: .utility) {
-                try makeEncryptedThumbnail(for: file.url)
+                try self.makeEncryptedThumbnail(for: file.url)
             }.value
             if let thumb {
                 try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
@@ -1863,7 +1863,7 @@ struct VDriveHomeView: View {
                 try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
                 transferLabel = "Выгружено \(index + 1) из \(pending.count). Создаю миниатюру в фоне…"
                 let thumb = try await Task.detached(priority: .utility) {
-                    try makeEncryptedThumbnail(for: file.url)
+                    try self.makeEncryptedThumbnail(for: file.url)
                 }.value
                 if let thumb {
                     transferLabel = "Передаю миниатюру: \(index + 1) из \(pending.count)"
