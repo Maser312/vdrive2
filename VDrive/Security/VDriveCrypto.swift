@@ -151,6 +151,7 @@ enum VDriveCrypto {
 }
 
 
+extension VDriveCrypto {
     // Chunked authenticated file format. Keeps peak memory bounded to one chunk
     // instead of loading large videos into RAM. Legacy AES-GCM blobs remain readable.
     private static let fileMagic = Data("VDRCHNK1".utf8)
