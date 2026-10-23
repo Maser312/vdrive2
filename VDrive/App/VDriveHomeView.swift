@@ -1231,6 +1231,7 @@ struct VDriveHomeView: View {
                         UIPasteboard.general.string = displayedVaultKey
                         message = "Ключ скопирован. Храни его в безопасном месте."
                     }
+                    .disabled(VDriveCrypto.existingLocalKeyData() == nil)
                     Text("Ключ хранится в Keychain этого iPhone. Для автоматического восстановления после переустановки он также сохраняется в закрытой папке данных твоего Google Drive. Доступ к Google-аккаунту означает доступ к этой копии ключа.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
@@ -1323,8 +1324,10 @@ struct VDriveHomeView: View {
                     let name = UUID().uuidString + "__A" + String(Int(addedTimestamp)) +
                         "__C" + String(Int(captureTimestamp)) + "__media." + ext + ".vdrive"
                     let url = documentsURL().appendingPathComponent(name)
-                    try FileManager.default.copyItem(at: transferred.url, to: url)
-                    try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+                    try await Task.detached(priority: .utility) {
+                        try FileManager.default.copyItem(at: transferred.url, to: url)
+                        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+                    }.value
                     if let jpeg = await Task.detached(priority: .utility, operation: {
                         VaultThumbnail.makeJPEGThumbnail(fromFileURL: url, filename: "media." + ext)
                     }).value {
@@ -1434,7 +1437,9 @@ struct VDriveHomeView: View {
                     "__C" + String(format: "%.3f", captureTimestamp) + "__" + safeName + ".vdrive"
                 let destination = documentsURL().appendingPathComponent(name)
                 do {
-                    try copyImportedFile(from: sourceURL, to: destination)
+                    try await Task.detached(priority: .utility) {
+                        try copyImportedFile(from: sourceURL, to: destination)
+                    }.value
                 } catch {
                     skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
                     continue
@@ -1821,7 +1826,10 @@ struct VDriveHomeView: View {
             try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
-            if let thumb = try makeEncryptedThumbnail(for: file.url) {
+            let thumb = try await Task.detached(priority: .utility) {
+                try makeEncryptedThumbnail(for: file.url)
+            }.value
+            if let thumb {
                 try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
             }
             transferProgress = 2
