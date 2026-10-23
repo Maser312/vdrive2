@@ -2033,10 +2033,11 @@ struct VDriveHomeView: View {
         let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey])) ?? [])
             .filter { $0.pathExtension == "vdrive" }
         let plainPaths = Set(localURLs.filter { isClearlyPlaintextFile($0) }.map { $0.path })
-        return await Task.detached(priority: .utility) { () -> Bool in
+        let validation = await Task.detached(priority: .utility) { () -> (valid: Bool, provedByLegacyFile: Bool) in
+            var provedByLegacyFile = false
             for url in localURLs where !plainPaths.contains(url.path) {
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                guard size <= 256 * 1024 * 1024 else { return false }
+                guard size <= 256 * 1024 * 1024 else { return (false, false) }
                 let matches = autoreleasepool { () -> Bool in
                     do {
                         let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -2044,12 +2045,17 @@ struct VDriveHomeView: View {
                         return true
                     } catch { return false }
                 }
-                if !matches { return false }
+                if !matches { return (false, false) }
+                provedByLegacyFile = true
             }
-            // Existing Keychain key mismatch plus only plaintext local files is not
-            // enough evidence to replace the key when switching Google accounts.
-            return VDriveCrypto.existingLocalKeyData() == nil || VDriveCrypto.existingLocalKeyData() == candidateData
+            return (true, provedByLegacyFile)
         }.value
+        guard validation.valid else { return false }
+        // A different existing Keychain key may only be replaced if a legacy
+        // encrypted local file proves the candidate, not merely because files are plaintext.
+        return VDriveCrypto.existingLocalKeyData() == nil
+            || VDriveCrypto.existingLocalKeyData() == candidateData
+            || validation.provedByLegacyFile
     }
 
     private func pinDigest(_ value: String) -> String {
