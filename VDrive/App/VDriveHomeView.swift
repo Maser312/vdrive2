@@ -2169,9 +2169,22 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
     }
 
+    func uploadPlainFile(_ plaintextFile: URL, key: SymmetricKey) async throws {
+        let stagingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VDrive-cloud-upload-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+        let encryptedFile = stagingDirectory.appendingPathComponent(plaintextFile.lastPathComponent)
+        try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
+        try await upload(encryptedFile)
+        var map = fileIDs
+        map[plaintextFile.lastPathComponent] = map.removeValue(forKey: encryptedFile.lastPathComponent)
+        fileIDs = map
+    }
+
     func upload(_ file: URL) async throws {
         try await ensureAccessToken()
-        // Assemble the multipart request on disk so large videos are not duplicated in RAM.
+        // Assemble multipart body on disk; do not duplicate large encrypted videos in RAM.
         let boundary = "vdrive-\(UUID().uuidString)"
         let metadata: [String: Any] = ["name": file.lastPathComponent, "mimeType": "application/octet-stream"]
         let metadataData = try JSONSerialization.data(withJSONObject: metadata)
@@ -2244,15 +2257,24 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return remote
     }
 
-    func downloadFile(driveID: String, name: String, to directory: URL) async throws {
+    func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey) async throws {
         try await ensureAccessToken()
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (downloadedURL, response) = try await URLSession.shared.download(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            try? FileManager.default.removeItem(at: downloadedURL)
             throw DriveError.server("Не удалось скачать " + name)
         }
-        try data.write(to: directory.appendingPathComponent(name), options: [.atomic, .completeFileProtection])
+        let destination = directory.appendingPathComponent(name)
+        let staging = directory.appendingPathComponent("." + UUID().uuidString + ".vdrive-part")
+        defer { try? FileManager.default.removeItem(at: downloadedURL); try? FileManager.default.removeItem(at: staging) }
+        try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key)
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
+        } else {
+            try FileManager.default.moveItem(at: staging, to: destination)
+        }
     }
 
     func downloadThumbnail(named name: String) async throws -> Data? {
@@ -2280,7 +2302,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return data
     }
 
-    func downloadMissing(to directory: URL, localNames: Set<String>) async throws -> Int {
+    func downloadMissing(to directory: URL, localNames: Set<String>, key: SymmetricKey) async throws -> Int {
         try await ensureAccessToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
         components.queryItems = [
@@ -2311,13 +2333,14 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
             var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(item.id)?alt=media")!)
             request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (downloadedURL, response) = try await URLSession.shared.download(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                try? FileManager.default.removeItem(at: downloadedURL)
                 throw DriveError.server("Не удалось скачать \(item.name)")
             }
-            // Re-check just before writing to avoid clobbering a file created while downloading.
+            defer { try? FileManager.default.removeItem(at: downloadedURL) }
             guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
-            try data.write(to: destination, options: [.atomic, .completeFileProtection])
+            try VDriveCrypto.decryptFile(at: downloadedURL, to: destination, key: key)
             count += 1
         }
         return count
