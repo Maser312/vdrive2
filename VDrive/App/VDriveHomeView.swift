@@ -199,7 +199,8 @@ private struct VaultThumbnail: View {
                     let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                     guard size <= 256 * 1024 * 1024,
                           let stored = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-                          let legacy = try? VDriveCrypto.open(stored, key: VDriveCrypto.localKey()) else { return nil }
+                          let keyData = VDriveCrypto.existingLocalKeyData(),
+                          let legacy = try? VDriveCrypto.open(stored, key: SymmetricKey(data: keyData)) else { return nil }
                     return Self.makeJPEGThumbnail(from: legacy, filename: name)
                 }.value
                 if let jpeg {
@@ -1647,8 +1648,12 @@ struct VDriveHomeView: View {
             try FileManager.default.copyItem(at: file.url, to: temp)
             return temp
         }
+        guard let keyData = VDriveCrypto.existingLocalKeyData() else {
+            try FileManager.default.copyItem(at: file.url, to: temp)
+            return temp
+        }
         do {
-            try VDriveCrypto.decryptFile(at: file.url, to: temp, key: VDriveCrypto.localKey())
+            try VDriveCrypto.decryptFile(at: file.url, to: temp, key: SymmetricKey(data: keyData))
         } catch {
             try FileManager.default.copyItem(at: file.url, to: temp)
         }
@@ -1927,8 +1932,9 @@ struct VDriveHomeView: View {
                 // With no local proof (e.g. after reinstall), retain the one-time code flow.
                 let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
                     .filter { $0.pathExtension == "vdrive" }
-                if !autoKeyMismatch, !localURLs.isEmpty, let localKey = try? VDriveCrypto.localKey(),
-                   await localFilesMatchKey(localKey) {
+                if !autoKeyMismatch, !localURLs.isEmpty,
+                   let localKeyData = VDriveCrypto.existingLocalKeyData(),
+                   await localFilesMatchKey(SymmetricKey(data: localKeyData)) {
                     do {
                         try await GoogleDriveStore.shared.createAutoKeyIfMissing(try VDriveCrypto.localKeyData())
                         cloudVaultUnlocked = true
