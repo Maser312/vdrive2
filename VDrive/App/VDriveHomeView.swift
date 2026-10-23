@@ -278,7 +278,49 @@ private struct VaultThumbnail: View {
                 return nil
             }
         } else {
-            mediaImage = UIImage(data: data)
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            mediaImage = UIImage(cgImage: thumbnail)
+        }
+        guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
+        return renderer.jpegData(withCompressionQuality: 0.58) { _ in
+            let scale = min(320 / mediaImage.size.width, 320 / mediaImage.size.height)
+            let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
+            mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
+        }
+    }
+
+    static func makeJPEGThumbnail(fromFileURL url: URL, filename: String) -> Data? {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv", "3gp"]
+        let mediaImage: UIImage?
+        if videoExtensions.contains(ext) {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 640, height: 640)
+            generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+            do {
+                let frame = try generator.copyCGImage(at: CMTime(seconds: 0.5, preferredTimescale: 600), actualTime: nil)
+                mediaImage = UIImage(cgImage: frame)
+            } catch { return nil }
+        } else {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            mediaImage = UIImage(cgImage: thumbnail)
         }
         guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
@@ -1346,7 +1388,7 @@ struct VDriveHomeView: View {
             }) { success, error in
                 Task { @MainActor in
                     if success {
-                        message = "Копии зашифрованы в VDrive. Исходники перемещены в «Недавно удалённые»."
+                        message = "Копии сохранены в VDrive. Исходники перемещены в «Недавно удалённые»."
                     } else {
                         message = "Копии сохранены в VDrive, но оригиналы не удалены: \(error?.localizedDescription ?? "неизвестная ошибка")"
                     }
@@ -1393,7 +1435,7 @@ struct VDriveHomeView: View {
             if added == 0 {
                 message = skipped.isEmpty ? "Файлы не были добавлены." : "Не добавлено: " + skipped.joined(separator: ", ")
             } else {
-                message = "Добавлено и зашифровано: \(added)" + (skipped.isEmpty ? "" : ". Пропущено: " + skipped.joined(separator: ", "))
+                message = "Добавлено на устройство: \(added)" + (skipped.isEmpty ? "" : ". Пропущено: " + skipped.joined(separator: ", "))
             }
             if added > 0 && isConnected {
                 pendingCloudSync = true
@@ -1405,6 +1447,28 @@ struct VDriveHomeView: View {
         } catch {
             message = "Импорт не удался: \(error.localizedDescription)"
         }
+    }
+
+    private func copyImportedFile(from sourceURL: URL, to destination: URL) throws {
+        let hasAccess = sourceURL.startAccessingSecurityScopedResource()
+        defer { if hasAccess { sourceURL.stopAccessingSecurityScopedResource() } }
+        var coordinationError: NSError?
+        var copyError: Error?
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        coordinator.coordinate(readingItemAt: sourceURL, options: [], error: &coordinationError) { readableURL in
+            do {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: readableURL.path, isDirectory: &isDirectory) else {
+                    throw CocoaError(.fileReadNoSuchFile)
+                }
+                guard !isDirectory.boolValue else { throw CocoaError(.fileReadUnsupportedScheme) }
+                try FileManager.default.copyItem(at: readableURL, to: destination)
+                try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete],
+                                                      ofItemAtPath: destination.path)
+            } catch { copyError = error }
+        }
+        if let coordinationError { throw coordinationError }
+        if let copyError { throw copyError }
     }
 
     private func readImportedFile(from sourceURL: URL) throws -> Data {
@@ -1439,32 +1503,11 @@ struct VDriveHomeView: View {
         return rawData
     }
 
-    private func makeEncryptedThumbnail(for encryptedFile: URL) throws -> Data? {
-        let original = try Data(contentsOf: encryptedFile, options: [.mappedIfSafe])
-        let rawName = encryptedFile.deletingPathExtension().lastPathComponent
+    private func makeEncryptedThumbnail(for localFile: URL) throws -> Data? {
+        let rawName = localFile.deletingPathExtension().lastPathComponent
         let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
-        let ext = (mediaName as NSString).pathExtension.lowercased()
-        let image: UIImage?
-        if ["mov", "mp4", "m4v", "avi", "mkv"].contains(ext) {
-            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("vdrive-poster-" + UUID().uuidString + "." + ext)
-            try original.write(to: temp, options: [.atomic, .completeFileProtection])
-            defer { try? FileManager.default.removeItem(at: temp) }
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: temp))
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 320, height: 320)
-            let frame = try generator.copyCGImage(at: CMTime(seconds: 0.2, preferredTimescale: 600), actualTime: nil)
-            image = UIImage(cgImage: frame)
-        } else {
-            image = UIImage(data: original)
-        }
-        guard let image else { return nil }
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
-        let jpeg = renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / image.size.width, 320 / image.size.height)
-            let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            image.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
-        }
-        return try VDriveCrypto.seal(jpeg, key: key)
+        guard let jpeg = VaultThumbnail.makeJPEGThumbnail(fromFileURL: localFile, filename: mediaName) else { return nil }
+        return try VDriveCrypto.seal(jpeg, key: VDriveCrypto.localKey())
     }
 
     @MainActor private func showFileProperties(_ file: VaultFile) async {
