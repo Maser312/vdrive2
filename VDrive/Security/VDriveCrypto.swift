@@ -37,6 +37,24 @@ enum VDriveCrypto {
         return SymmetricKey(data: bytes)
     }
 
+    private static let plaintextFileListKey = "vdrive.localPlaintextFiles"
+
+    static func markLocalPlaintextFile(_ url: URL) {
+        var names = Set(UserDefaults.standard.stringArray(forKey: plaintextFileListKey) ?? [])
+        names.insert(url.lastPathComponent)
+        UserDefaults.standard.set(Array(names), forKey: plaintextFileListKey)
+    }
+
+    static func unmarkLocalPlaintextFile(_ url: URL) {
+        var names = Set(UserDefaults.standard.stringArray(forKey: plaintextFileListKey) ?? [])
+        names.remove(url.lastPathComponent)
+        UserDefaults.standard.set(Array(names), forKey: plaintextFileListKey)
+    }
+
+    static func isMarkedLocalPlaintextFile(_ url: URL) -> Bool {
+        UserDefaults.standard.stringArray(forKey: plaintextFileListKey)?.contains(url.lastPathComponent) ?? false
+    }
+
     static func existingLocalKeyData() -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
