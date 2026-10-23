@@ -2397,6 +2397,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         } else {
             try FileManager.default.moveItem(at: staging, to: destination)
         }
+        VDriveCrypto.markLocalPlaintextFile(destination)
     }
 
     func downloadThumbnail(named name: String) async throws -> Data? {
@@ -2465,6 +2466,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             try await Task.detached(priority: .utility) {
                 try VDriveCrypto.decryptFile(at: downloadedURL, to: destination, key: key)
             }.value
+            VDriveCrypto.markLocalPlaintextFile(destination)
             count += 1
         }
         return count
