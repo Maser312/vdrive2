@@ -162,14 +162,16 @@ private struct VaultThumbnail: View {
                 image = cachedImage
                 return
             }
-            do {
-                let key = try VDriveCrypto.localKey()
-                let jpeg = try await Task.detached(priority: .utility) {
-                    try await ThumbnailCryptoQueue.shared.decrypt(cachedPreview, key: key)
-                }.value
-                image = UIImage(data: jpeg)
-                if image != nil { return }
-            } catch { }
+            if let keyData = VDriveCrypto.existingLocalKeyData() {
+                do {
+                    let key = SymmetricKey(data: keyData)
+                    let jpeg = try await Task.detached(priority: .utility) {
+                        try await ThumbnailCryptoQueue.shared.decrypt(cachedPreview, key: key)
+                    }.value
+                    image = UIImage(data: jpeg)
+                    if image != nil { return }
+                } catch { }
+            }
         }
 
         // Migrate previews created by the previous version, then remove the plaintext copy.
