@@ -375,7 +375,11 @@ struct VDriveHomeView: View {
 
     var body: some View {
         mainContent
-            .task { refreshFiles() }
+            .task {
+                refreshFiles()
+                await migrateLegacyLocalFiles()
+                refreshFiles()
+            }
         .onChange(of: scenePhase) { newPhase in
             handleScenePhaseChange(newPhase)
             if newPhase == .active { flipMotion.start() } else { flipMotion.stop() }
@@ -1123,13 +1127,17 @@ struct VDriveHomeView: View {
         .frame(maxWidth: .infinity, minHeight: 46)
     }
 
+    private var displayedVaultKey: String {
+        (try? VDriveCrypto.localKeyData().base64EncodedString()) ?? "Ключ недоступен"
+    }
+
     private var settingsSheet: some View {
         NavigationStack {
             Form {
                 Section("Занятая память") {
                     HStack { Label("На телефоне", systemImage: "iphone"); Spacer(); Text(ByteCountFormatter.string(fromByteCount: localStorageBytes, countStyle: .file)).fontWeight(.semibold).monospacedDigit() }
                     HStack { Label("Google Drive", systemImage: "cloud"); Spacer(); Text(ByteCountFormatter.string(fromByteCount: cloudStorageBytes, countStyle: .file)).fontWeight(.semibold).monospacedDigit() }
-                    Text("Размер зашифрованных файлов библиотеки. Обновляется при синхронизации и изменениях списка файлов.").font(.footnote).foregroundStyle(.secondary)
+                    Text("На телефоне оригиналы и миниатюры хранятся открытыми для быстрого просмотра; в Google Drive они шифруются.").font(.footnote).foregroundStyle(.secondary)
                     Button("Обновить статистику") { refreshFiles(); Task { await refreshCloudInventory() } }
                 }
                 Section("Google Drive") {
@@ -1149,8 +1157,20 @@ struct VDriveHomeView: View {
                     Text("В Google Drive хранятся зашифрованные .vdrive-файлы, а не открытые фото.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                Section("Секретный ключ") {
-                    Text("При первом подключении Google VDrive создаёт секретный ключ. Сохрани его отдельно: после переустановки он понадобится для доступа к облачным файлам.")
+                Section("Ключ шифрования") {
+                    Text(displayedVaultKey)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Скопировать ключ", systemImage: "doc.on.doc") {
+                        UIPasteboard.general.string = displayedVaultKey
+                        message = "Ключ скопирован. Храни его в безопасном месте."
+                    }
+                    Text("Ключ хранится в Keychain этого iPhone. Для автоматического восстановления после переустановки он также сохраняется в закрытой папке данных твоего Google Drive. Доступ к Google-аккаунту означает доступ к этой копии ключа.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("Восстановление") {
+                    Text("При обычном входе в тот же Google-аккаунт VDrive пытается восстановить ключ автоматически. Старый код восстановления оставлен для совместимости.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("Ввести секретный ключ VDrive", systemImage: "key.fill") {
                         showSettings = false
@@ -1226,7 +1246,7 @@ struct VDriveHomeView: View {
                         failures.append("Элемент \(index + 1): iOS не передала данные")
                         continue
                     }
-                    transferLabel = "Шифрую и сохраняю: \(index + 1) из \(items.count)"
+                    transferLabel = "Сохраняю на iPhone: \(index + 1) из \(items.count)"
                     message = transferLabel
                     let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "bin"
                     let addedTimestamp = Date().timeIntervalSince1970
@@ -1536,15 +1556,22 @@ struct VDriveHomeView: View {
     }
 
     private func decryptedTemporaryURL(for file: VaultFile) throws -> URL {
-        let stored = try Data(contentsOf: file.url, options: [.mappedIfSafe])
-        let plain = (try? VDriveCrypto.open(stored, key: VDriveCrypto.localKey())) ?? stored
         let rawName = file.url.deletingPathExtension().lastPathComponent
         let pieces = rawName.components(separatedBy: "__")
         let originalName = pieces.count > 1 ? pieces.dropFirst().joined(separator: "__") : rawName
-        let ext = originalName.split(separator: ".").last.map(String.init) ?? "bin"
-        let safeName = originalName.isEmpty ? "VDrive-file.\(ext)" : originalName
+        let safeName = originalName.isEmpty ? "VDrive-file.bin" : originalName
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-\(UUID().uuidString)-\(safeName)")
-        try plain.write(to: temp, options: [.atomic, .completeFileProtection])
+        if isClearlyPlaintextFile(file.url) {
+            try FileManager.default.copyItem(at: file.url, to: temp)
+            return temp
+        }
+        do {
+            try VDriveCrypto.decryptFile(at: file.url, to: temp, key: VDriveCrypto.localKey())
+        } catch {
+            // Unrecognized user file types may already be plaintext. Preserve them
+            // rather than failing export; authenticated legacy blobs decrypt above.
+            try FileManager.default.copyItem(at: file.url, to: temp)
+        }
         return temp
     }
 
@@ -1553,7 +1580,13 @@ struct VDriveHomeView: View {
         guard file.isLocal else { Task { await downloadAndOpen(file) }; return }
         do {
             let currentFiles = sortedFiles.filter { $0.isLocal }
-            let urls = currentFiles.map { $0.url }
+            var temporaryURLs: [URL] = []
+            let urls = try currentFiles.map { current -> URL in
+                if isClearlyPlaintextFile(current.url) { return current.url }
+                let temp = try decryptedTemporaryURL(for: current)
+                temporaryURLs.append(temp)
+                return temp
+            }
             let items = zip(currentFiles, urls).enumerated().map { index, pair in
                 PreviewItem(id: index, name: pair.0.displayName, url: pair.1)
             }
@@ -1561,7 +1594,7 @@ struct VDriveHomeView: View {
                 message = "Хранилище ещё загружается. Попробуйте снова."
                 return
             }
-            previewURLs = []
+            previewURLs = temporaryURLs
             previewIndex = currentFiles.firstIndex(of: file) ?? 0
             previewPresentation = PreviewPresentation(items: items, initialIndex: previewIndex)
         } catch {
