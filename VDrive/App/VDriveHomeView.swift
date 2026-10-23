@@ -1480,9 +1480,9 @@ struct VDriveHomeView: View {
 
         do {
             let details = try await Task.detached(priority: .utility) { () throws -> String in
-                let encrypted = try Data(contentsOf: file.url, options: [.mappedIfSafe])
+                let stored = try Data(contentsOf: file.url, options: [.mappedIfSafe])
                 let key = try VDriveCrypto.localKey()
-                let plain = try VDriveCrypto.open(encrypted, key: key)
+                let plain = (try? VDriveCrypto.open(stored, key: key)) ?? stored
                 let ext = (file.displayName as NSString).pathExtension.lowercased()
                 let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
                 let formatter = ByteCountFormatter()
@@ -1882,9 +1882,10 @@ struct VDriveHomeView: View {
             try await GoogleDriveStore.shared.connect(clientID: clientID)
             isConnected = true
             message = "Google подключён. Проверяю защищённое хранилище…"
+            var autoKeyMismatch = false
 
-            // Prefer automatic recovery, but validate the candidate against every
-            // local encrypted file before changing Keychain.
+            // Prefer automatic recovery, but never replace an existing device key
+            // merely because the local originals are now plaintext.
             if let autoKey = try await GoogleDriveStore.shared.fetchAutoKey() {
                 let candidate = SymmetricKey(data: autoKey)
                 if autoKey.count == 32, await localFilesMatchKey(candidate) {
@@ -1896,8 +1897,9 @@ struct VDriveHomeView: View {
                     message = "VDrive разблокирован через Google. Секретный ключ вводить не нужно."
                     return
                 }
+                autoKeyMismatch = true
                 cloudVaultUnlocked = false
-                message = "Автоматический ключ не совпал с локальными файлами. Ничего не заменено; потребуется безопасное восстановление."
+                message = "Автоматический ключ Google не совпадает с ключом на этом устройстве. Ключ не заменён; проверь, что вошёл в нужный аккаунт."
             }
 
             if let record = try await GoogleDriveStore.shared.fetchCloudKeyRecord() {
@@ -1906,7 +1908,7 @@ struct VDriveHomeView: View {
                 // With no local proof (e.g. after reinstall), retain the one-time code flow.
                 let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
                     .filter { $0.pathExtension == "vdrive" }
-                if !localURLs.isEmpty, let localKey = try? VDriveCrypto.localKey(),
+                if !autoKeyMismatch, !localURLs.isEmpty, let localKey = try? VDriveCrypto.localKey(),
                    await localFilesMatchKey(localKey) {
                     do {
                         try await GoogleDriveStore.shared.createAutoKeyIfMissing(try VDriveCrypto.localKeyData())
@@ -1958,40 +1960,7 @@ struct VDriveHomeView: View {
             // Decode without changing Keychain first. If local files use another key,
             // preserve the current key and ask the user to resolve the vault mismatch.
             let candidateKey = try VDriveCrypto.cloudKey(from: record, code: recoveryCodeInput)
-            let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
-                .filter { $0.pathExtension == "vdrive" }
-
-            // Most users are unlocking the cloud on the same installation that encrypted
-            // the local files. Compare the 32-byte Keychain key first: decrypting every
-            // photo/video just to prove a key we already have can exhaust iPhone memory.
-            let currentKey = try? VDriveCrypto.localKey()
-            let keychainMatches = currentKey.map { current in
-                current.withUnsafeBytes { Data($0) } == candidateKey.withUnsafeBytes { Data($0) }
-            } ?? false
-
-            let localFilesMatch: Bool
-            if keychainMatches {
-                localFilesMatch = true
-            } else {
-                // After a reinstall or Keychain mismatch, validate sequentially off the
-                // main thread and release each decrypted payload before reading the next.
-                localFilesMatch = await Task.detached(priority: .utility) { () -> Bool in
-                    for url in localURLs {
-                        let matches = autoreleasepool { () -> Bool in
-                            do {
-                                let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
-                                let plaintext = try VDriveCrypto.open(encrypted, key: candidateKey)
-                                _ = plaintext.count
-                                return true
-                            } catch {
-                                return false
-                            }
-                        }
-                        if !matches { return false }
-                    }
-                    return true
-                }.value
-            }
+            let localFilesMatch = await localFilesMatchKey(candidateKey)
 
             guard localFilesMatch else {
                 recoveryCodeInput = ""
