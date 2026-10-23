@@ -255,7 +255,21 @@ enum VDriveCrypto {
         return result
     }
 
+}
+
 private extension Data {
+    mutating func appendBigEndian<T: FixedWidthInteger>(_ value: T) {
+        var big = value.bigEndian
+        Swift.withUnsafeBytes(of: &big) { append(contentsOf: $0) }
+    }
+
+    func readBigEndianUInt64(at offset: Int) -> UInt64 {
+        (0..<8).reduce(UInt64(0)) { ($0 << 8) | UInt64(self[offset + $1]) }
+    }
+
+    func readBigEndianUInt32(at offset: Int) -> UInt32 {
+        (0..<4).reduce(UInt32(0)) { ($0 << 8) | UInt32(self[offset + $1]) }
+    }
     func base64URLEncodedString() -> String {
         base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
