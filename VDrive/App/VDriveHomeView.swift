@@ -1584,7 +1584,10 @@ struct VDriveHomeView: View {
         var migrated = 0
         var skippedLarge = 0
         for url in urls {
-            if isClearlyPlaintextFile(url) { continue }
+            if isClearlyPlaintextFile(url) {
+                VDriveCrypto.markLocalPlaintextFile(url)
+                continue
+            }
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             // Legacy whole-file AES-GCM needs the complete ciphertext and plaintext
             // in memory. Avoid risking an iPhone memory-pressure kill on huge videos.
