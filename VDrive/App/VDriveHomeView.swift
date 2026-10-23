@@ -8,6 +8,7 @@ import LocalAuthentication
 import AuthenticationServices
 import AVKit
 import UniformTypeIdentifiers
+import ImageIO
 import QuickLook
 import CryptoKit
 import Security
@@ -172,15 +173,18 @@ private struct VaultThumbnail: View {
         }
 
         if file.isLocal {
-            // One-time generation for files imported before cached thumbnails existed.
-            // The original is read/decrypted only if no preview cache is available.
+            // Build a small preview directly from the local file URL. ImageIO and
+            // AVAsset decode only a thumbnail/frame, not the full-resolution media.
             let url = file.url
             let name = file.displayName
             do {
-                let jpeg = try await Task.detached(priority: .utility) { () throws -> Data? in
-                    let fileData = try Data(contentsOf: url, options: [.mappedIfSafe])
-                    let plain = (try? VDriveCrypto.open(fileData, key: VDriveCrypto.localKey())) ?? fileData
-                    return Self.makeJPEGThumbnail(from: plain, filename: name)
+                let jpeg = await Task.detached(priority: .utility) { () -> Data? in
+                    if let direct = Self.makeJPEGThumbnail(fromFileURL: url, filename: name) { return direct }
+                    let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    guard size <= 256 * 1024 * 1024,
+                          let stored = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+                          let legacy = try? VDriveCrypto.open(stored, key: VDriveCrypto.localKey()) else { return nil }
+                    return Self.makeJPEGThumbnail(from: legacy, filename: name)
                 }.value
                 if let jpeg {
                     try? await Task.detached(priority: .utility) {
@@ -1361,14 +1365,6 @@ struct VDriveHomeView: View {
             var added = 0
             var skipped: [String] = []
             for sourceURL in urls {
-                let raw: Data
-                do {
-                    raw = try readImportedFile(from: sourceURL)
-                } catch {
-                    skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
-                    continue
-                }
-
                 let originalName = sourceURL.lastPathComponent.replacingOccurrences(of: "/", with: "_")
                 let safeName = originalName.isEmpty ? "file.bin" : originalName
                 let addedTimestamp = Date().timeIntervalSince1970
@@ -1377,9 +1373,14 @@ struct VDriveHomeView: View {
                 let name = UUID().uuidString + "__A" + String(format: "%.3f", addedTimestamp) +
                     "__C" + String(format: "%.3f", captureTimestamp) + "__" + safeName + ".vdrive"
                 let destination = documentsURL().appendingPathComponent(name)
-                try raw.write(to: destination, options: [.atomic, .completeFileProtection])
+                do {
+                    try copyImportedFile(from: sourceURL, to: destination)
+                } catch {
+                    skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
+                    continue
+                }
                 if let jpeg = await Task.detached(priority: .utility, operation: {
-                    VaultThumbnail.makeJPEGThumbnail(from: raw, filename: safeName)
+                    VaultThumbnail.makeJPEGThumbnail(fromFileURL: destination, filename: safeName)
                 }).value {
                     try? await Task.detached(priority: .utility) {
                         try VaultThumbnail.saveLocalThumbnail(jpeg, for: name)
