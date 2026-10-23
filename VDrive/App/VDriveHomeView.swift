@@ -21,7 +21,7 @@ private struct PickerFileTransfer: Transferable {
         FileRepresentation(importedContentType: .item) { received in
             let ext = received.file.pathExtension
             let temporary = FileManager.default.temporaryDirectory
-                .appendingPathComponent("VDrive-picker-\\(UUID().uuidString)")
+                .appendingPathComponent("VDrive-picker-\(UUID().uuidString)")
                 .appendingPathExtension(ext)
             try FileManager.default.copyItem(at: received.file, to: temporary)
             return PickerFileTransfer(url: temporary)
@@ -1307,13 +1307,14 @@ struct VDriveHomeView: View {
                 transferLabel = "Читаю фото или видео: \(index + 1) из \(items.count)"
                 message = transferLabel
                 do {
-                    guard let raw = try await item.loadTransferable(type: Data.self) else {
-                        failures.append("Элемент \(index + 1): iOS не передала данные")
+                    guard let transferred = try await item.loadTransferable(type: PickerFileTransfer.self) else {
+                        failures.append("Элемент \\(index + 1): iOS не передала файл")
                         continue
                     }
-                    transferLabel = "Сохраняю на iPhone: \(index + 1) из \(items.count)"
+                    defer { try? FileManager.default.removeItem(at: transferred.url) }
+                    transferLabel = "Сохраняю на iPhone: \\(index + 1) из \\(items.count)"
                     message = transferLabel
-                    let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "bin"
+                    let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? transferred.url.pathExtension
                     let addedTimestamp = Date().timeIntervalSince1970
                     let captureDate: Date? = item.itemIdentifier.flatMap { identifier in
                         PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject?.creationDate
@@ -1322,9 +1323,10 @@ struct VDriveHomeView: View {
                     let name = UUID().uuidString + "__A" + String(Int(addedTimestamp)) +
                         "__C" + String(Int(captureTimestamp)) + "__media." + ext + ".vdrive"
                     let url = documentsURL().appendingPathComponent(name)
-                    try raw.write(to: url, options: [.atomic, .completeFileProtection])
+                    try FileManager.default.copyItem(at: transferred.url, to: url)
+                    try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
                     if let jpeg = await Task.detached(priority: .utility, operation: {
-                        VaultThumbnail.makeJPEGThumbnail(from: raw, filename: "media." + ext)
+                        VaultThumbnail.makeJPEGThumbnail(fromFileURL: url, filename: "media." + ext)
                     }).value {
                         try? await Task.detached(priority: .utility) {
                             try VaultThumbnail.saveLocalThumbnail(jpeg, for: name)
