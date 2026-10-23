@@ -347,35 +347,7 @@ private struct VaultThumbnail: View {
         }
     }
 
-    private func makeEncryptedThumbnailForCloudFile(_ encryptedFile: URL, key: SymmetricKey) throws -> Data? {
-        let sealed = try Data(contentsOf: encryptedFile)
-        let original = try VDriveCrypto.open(sealed, key: key)
-        let rawName = encryptedFile.deletingPathExtension().lastPathComponent
-        let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
-        let ext = (mediaName as NSString).pathExtension.lowercased()
-        let mediaImage: UIImage?
-        if ["mov", "mp4", "m4v", "avi", "mkv"].contains(ext) {
-            let temp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("vdrive-poster-" + UUID().uuidString + "." + ext)
-            try original.write(to: temp, options: [.atomic, .completeFileProtection])
-            defer { try? FileManager.default.removeItem(at: temp) }
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: temp))
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 320, height: 320)
-            let frame = try generator.copyCGImage(at: CMTime(seconds: 0.2, preferredTimescale: 600), actualTime: nil)
-            mediaImage = UIImage(cgImage: frame)
-        } else {
-            mediaImage = UIImage(data: original)
-        }
-        guard let mediaImage else { return nil }
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
-        let jpeg = renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / mediaImage.size.width, 320 / mediaImage.size.height)
-            let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
-            mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
-        }
-        return try VDriveCrypto.seal(jpeg, key: key)
-    }
+
 }
 
 struct VDriveHomeView: View {
@@ -1193,7 +1165,7 @@ struct VDriveHomeView: View {
     }
 
     private var displayedVaultKey: String {
-        VDriveCrypto.existingLocalKeyData()?.base64EncodedString() ?? "Подключи Google Drive или добавь первый файл, чтобы создать ключ"
+        VDriveCrypto.existingLocalKeyData()?.base64EncodedString() ?? "Подключи Google Drive, чтобы создать ключ"
     }
 
     private var settingsSheet: some View {
@@ -1238,7 +1210,7 @@ struct VDriveHomeView: View {
                 Section("Восстановление") {
                     Text("При обычном входе в тот же Google-аккаунт VDrive пытается восстановить ключ автоматически. Старый код восстановления оставлен для совместимости.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    Button("Ввести секретный ключ VDrive", systemImage: "key.fill") {
+                    Button("Восстановить по старому коду", systemImage: "key.fill") {
                         showSettings = false
                         Task {
                             guard isConnected else {
@@ -1492,38 +1464,6 @@ struct VDriveHomeView: View {
         }
         if let coordinationError { throw coordinationError }
         if let copyError { throw copyError }
-    }
-
-    private func readImportedFile(from sourceURL: URL) throws -> Data {
-        let hasAccess = sourceURL.startAccessingSecurityScopedResource()
-        defer {
-            if hasAccess { sourceURL.stopAccessingSecurityScopedResource() }
-        }
-
-        var coordinationError: NSError?
-        var readError: Error?
-        var rawData: Data?
-        let coordinator = NSFileCoordinator(filePresenter: nil)
-        coordinator.coordinate(readingItemAt: sourceURL, options: [], error: &coordinationError) { readableURL in
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: readableURL.path, isDirectory: &isDirectory) else {
-                readError = CocoaError(.fileReadNoSuchFile)
-                return
-            }
-            guard !isDirectory.boolValue else {
-                readError = CocoaError(.fileReadUnsupportedScheme)
-                return
-            }
-            do {
-                rawData = try Data(contentsOf: readableURL, options: [.mappedIfSafe])
-            } catch {
-                readError = error
-            }
-        }
-        if let coordinationError { throw coordinationError }
-        if let readError { throw readError }
-        guard let rawData else { throw CocoaError(.fileReadUnknown) }
-        return rawData
     }
 
     private func makeEncryptedThumbnail(for localFile: URL) throws -> Data? {
