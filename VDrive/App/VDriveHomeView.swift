@@ -409,7 +409,7 @@ struct VDriveHomeView: View {
             Button("Удалить оригиналы", role: .destructive) { deleteImportedPhotoOriginals() }
             Button("Оставить в Фото", role: .cancel) { finishLocalImportAndSync() }
         } message: {
-            Text("Копии уже зашифрованы и сохранены внутри VDrive. Можно удалить исходные фото и видео из медиатеки Apple Фото. Они попадут в «Недавно удалённые» и не удалятся окончательно сразу.")
+            Text("Копии сохранены в VDrive на устройстве. При синхронизации в Google Drive они шифруются. Можно удалить исходные фото и видео из медиатеки Apple Фото; они попадут в «Недавно удалённые».")
         }
         .alert("Секретный ключ Authenticator", isPresented: $showAuthenticatorSecretEntry) {
             TextField("Base32 secret key", text: $authenticatorSecretDraft)
@@ -481,9 +481,12 @@ struct VDriveHomeView: View {
                     message = "Хранилище готово. Выгружай файлы вручную, когда закончишь добавлять их локально."
                 }
             }
-            Button("Закрыть без выгрузки", role: .cancel) {}
+            Button("Закрыть", role: .cancel) {
+                cloudVaultUnlocked = true
+                Task { await refreshCloudInventory(); refreshFiles() }
+            }
         } message: {
-            Text("Сохрани этот секретный ключ отдельно от телефона. Он понадобится после переустановки приложения. Google уже хранит зашифрованную запись для восстановления. Ключ: \(recoveryCode)")
+            Text("Это дополнительный старый код восстановления. Основной ключ шифрования можно скопировать в настройках; Google хранит его копию для автоматического восстановления.")
         }
         .alert("Восстановление VDrive", isPresented: $showCloudRecoveryPrompt) {
             SecureField("Секретный ключ", text: $recoveryCodeInput)
@@ -1939,9 +1942,9 @@ struct VDriveHomeView: View {
             do { try await GoogleDriveStore.shared.createAutoKeyIfMissing(try VDriveCrypto.localKeyData()) }
             catch { message = "Облако создано, но авто-восстановление не сохранилось: \(error.localizedDescription)" }
             recoveryCode = result.code
-            cloudVaultUnlocked = false
+            cloudVaultUnlocked = true
             showRecoveryCodeAlert = true
-            message = "Секретный ключ создан. Сохрани его, чтобы восстановить доступ после переустановки."
+            message = "Ключ создан и сохранён. Его можно посмотреть и скопировать в настройках."
         } catch {
             message = "Google Drive: \(error.localizedDescription)"
         }
@@ -2286,7 +2289,9 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: stagingDirectory) }
         let encryptedFile = stagingDirectory.appendingPathComponent(plaintextFile.lastPathComponent)
-        try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
+        try await Task.detached(priority: .utility) {
+            try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
+        }.value
         try await upload(encryptedFile)
         var map = fileIDs
         map[plaintextFile.lastPathComponent] = map.removeValue(forKey: encryptedFile.lastPathComponent)
@@ -2380,7 +2385,9 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         let destination = directory.appendingPathComponent(name)
         let staging = directory.appendingPathComponent("." + UUID().uuidString + ".vdrive-part")
         defer { try? FileManager.default.removeItem(at: downloadedURL); try? FileManager.default.removeItem(at: staging) }
-        try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key)
+        try await Task.detached(priority: .utility) {
+            try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key)
+        }.value
         if FileManager.default.fileExists(atPath: destination.path) {
             _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
         } else {
@@ -2451,7 +2458,9 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             }
             defer { try? FileManager.default.removeItem(at: downloadedURL) }
             guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
-            try VDriveCrypto.decryptFile(at: downloadedURL, to: destination, key: key)
+            try await Task.detached(priority: .utility) {
+                try VDriveCrypto.decryptFile(at: downloadedURL, to: destination, key: key)
+            }.value
             count += 1
         }
         return count
