@@ -9,9 +9,25 @@ import AuthenticationServices
 import AVKit
 import UniformTypeIdentifiers
 import ImageIO
+import CoreTransferable
 import QuickLook
 import CryptoKit
 import Security
+
+private struct PickerFileTransfer: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .item) { received in
+            let ext = received.file.pathExtension
+            let temporary = FileManager.default.temporaryDirectory
+                .appendingPathComponent("VDrive-picker-\\(UUID().uuidString)")
+                .appendingPathExtension(ext)
+            try FileManager.default.copyItem(at: received.file, to: temporary)
+            return PickerFileTransfer(url: temporary)
+        }
+    }
+}
 
 private struct VaultFile: Identifiable, Hashable {
     let id: String
