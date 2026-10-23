@@ -1528,6 +1528,67 @@ struct VDriveHomeView: View {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
 
+    private func isClearlyPlaintextFile(_ url: URL, filename: String? = nil) -> Bool {
+        let name = filename ?? VaultFile(id: url.lastPathComponent, url: url).displayName
+        let ext = (name as NSString).pathExtension.lowercased()
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let bytes = (try? handle.read(upToCount: 16)) ?? Data()
+        if ["jpg", "jpeg"].contains(ext) { return bytes.starts(with: [0xFF, 0xD8, 0xFF]) }
+        if ext == "png" { return bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) }
+        if ext == "gif" { return bytes.starts(with: Data("GIF8".utf8)) }
+        if ["mp4", "mov", "m4v", "3gp"].contains(ext) {
+            return bytes.count >= 8 && String(data: bytes[4..<8], encoding: .ascii) == "ftyp"
+        }
+        if ext == "pdf" { return bytes.starts(with: Data("%PDF".utf8)) }
+        if ["zip", "docx", "xlsx", "pptx", "odt", "ods", "odp"].contains(ext) {
+            return bytes.starts(with: [0x50, 0x4B, 0x03, 0x04])
+        }
+        if ["txt", "csv", "json", "xml", "md", "rtf"].contains(ext),
+           let text = String(data: bytes, encoding: .utf8) {
+            return !text.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\r" && $0 != "\t" }
+        }
+        return false
+    }
+
+    @MainActor private func migrateLegacyLocalFiles() async {
+        guard let key = try? VDriveCrypto.localKey() else { return }
+        let urls = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+            .filter { $0.pathExtension == "vdrive" }
+        var migrated = 0
+        var skippedLarge = 0
+        for url in urls {
+            if isClearlyPlaintextFile(url) { continue }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            // Legacy whole-file AES-GCM needs the complete ciphertext and plaintext
+            // in memory. Avoid risking an iPhone memory-pressure kill on huge videos.
+            if size > 256 * 1024 * 1024 {
+                skippedLarge += 1
+                continue
+            }
+            let staging = documentsURL().appendingPathComponent("." + UUID().uuidString + ".migration")
+            do {
+                try await Task.detached(priority: .utility) {
+                    try VDriveCrypto.decryptFile(at: url, to: staging, key: key)
+                }.value
+                if FileManager.default.fileExists(atPath: staging.path) {
+                    _ = try FileManager.default.replaceItemAt(url, withItemAt: staging)
+                    migrated += 1
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: staging)
+                // Plain files with uncommon extensions fail legacy authentication and
+                // are deliberately left untouched.
+            }
+        }
+        if migrated > 0 {
+            message = "Переведено в локальный открытый формат: \(migrated) файлов."
+        }
+        if skippedLarge > 0 {
+            message = "\(skippedLarge) старых крупных файлов пока оставлены в прежнем зашифрованном формате, чтобы не перегружать память. Остальные файлы доступны."
+        }
+    }
+
     private func refreshFiles() {
         let urls = (try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])) ?? []
         let local = urls.filter { $0.pathExtension == "vdrive" }.map { VaultFile(id: $0.lastPathComponent, url: $0) }
@@ -1561,15 +1622,14 @@ struct VDriveHomeView: View {
         let originalName = pieces.count > 1 ? pieces.dropFirst().joined(separator: "__") : rawName
         let safeName = originalName.isEmpty ? "VDrive-file.bin" : originalName
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-\(UUID().uuidString)-\(safeName)")
-        if isClearlyPlaintextFile(file.url) {
+        let size = (try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if isClearlyPlaintextFile(file.url) || size > 256 * 1024 * 1024 {
             try FileManager.default.copyItem(at: file.url, to: temp)
             return temp
         }
         do {
             try VDriveCrypto.decryptFile(at: file.url, to: temp, key: VDriveCrypto.localKey())
         } catch {
-            // Unrecognized user file types may already be plaintext. Preserve them
-            // rather than failing export; authenticated legacy blobs decrypt above.
             try FileManager.default.copyItem(at: file.url, to: temp)
         }
         return temp
