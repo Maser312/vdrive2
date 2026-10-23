@@ -37,6 +37,19 @@ enum VDriveCrypto {
         return SymmetricKey(data: bytes)
     }
 
+    static func existingLocalKeyData() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let bytes = result as? Data, bytes.count == 32 else { return nil }
+        return bytes
+    }
+
     /// Exports the existing local key for an explicitly authorized Google Drive recovery copy.
     static func localKeyData() throws -> Data {
         try localKey().withUnsafeBytes { Data($0) }
