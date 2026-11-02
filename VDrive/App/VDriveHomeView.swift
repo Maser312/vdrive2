@@ -216,22 +216,6 @@ private struct VaultThumbnail: View {
             }
         }
 
-        // Migrate previews created by the previous version, then remove the plaintext copy.
-        let legacyURL = Self.legacyLocalThumbnailURL(for: file.id)
-        if let legacyJPEG = try? Data(contentsOf: legacyURL, options: [.mappedIfSafe]),
-           UIImage(data: legacyJPEG) != nil {
-            do {
-                try await Task.detached(priority: .utility) {
-                    try Self.saveLocalThumbnail(legacyJPEG, for: file.id)
-                }.value
-                try? FileManager.default.removeItem(at: legacyURL)
-                image = UIImage(data: legacyJPEG)
-                return
-            } catch {
-                // Continue with regeneration/download; never show an error for cache migration.
-            }
-        }
-
         if file.isLocal {
             // Build a small preview directly from the local file URL. ImageIO and
             // AVAsset decode only a thumbnail/frame, not the full-resolution media.
@@ -266,9 +250,12 @@ private struct VaultThumbnail: View {
 
     @MainActor private func loadRemoteThumbnailOrMigrate() async throws -> UIImage? {
         let key = try VDriveCrypto.localKey()
-        guard let encryptedPreview = try await GoogleDriveStore.shared.downloadThumbnail(named: file.id + ".vthumb") else {
-            return nil
-        }
+        // Prefer the new full-bleed square preview. Fall back to legacy for cloud-only items.
+        let currentPreview = try await GoogleDriveStore.shared.downloadThumbnail(named: file.id + ".vthumb2")
+        let encryptedPreview = try await (currentPreview == nil
+            ? GoogleDriveStore.shared.downloadThumbnail(named: file.id + ".vthumb")
+            : currentPreview)
+        guard let encryptedPreview else { return nil }
         let jpeg = try await Task.detached(priority: .utility) {
             try await ThumbnailCryptoQueue.shared.decrypt(encryptedPreview, key: key)
         }.value
@@ -282,7 +269,8 @@ private struct VaultThumbnail: View {
     }
 
     nonisolated static func localThumbnailURL(for fileID: String) -> URL {
-        thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".vthumb")
+        // v2 invalidates old aspect-fit previews and forces regeneration from the original.
+        thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".vthumb2")
     }
 
     nonisolated static func legacyLocalThumbnailURL(for fileID: String) -> URL {
@@ -1125,7 +1113,7 @@ struct VDriveHomeView: View {
             for file in targets {
                 try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
                 if let thumb = try self.makeEncryptedThumbnail(for: file.url) {
-                    try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
+                    try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
             }
             await refreshCloudInventory()
@@ -1904,7 +1892,7 @@ struct VDriveHomeView: View {
                 try self.makeEncryptedThumbnail(for: file.url)
             }.value
             if let thumb {
-                try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
+                try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
             }
             transferProgress = 2
             refreshFiles()
@@ -1991,33 +1979,53 @@ struct VDriveHomeView: View {
     @MainActor private func syncAll() async {
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
-        let pending = files.filter { $0.isLocal && !$0.uploaded }
+        // Refresh thumbnails for every local original, including files already uploaded.
+        // This replaces stale aspect-fit previews in both the local cache and Drive.
+        let localFiles = files.filter { $0.isLocal }
+        let pending = localFiles.filter { !$0.uploaded }
         busy = true
         transferProgress = 0
-        transferTotal = pending.count
+        transferTotal = max(localFiles.count, 1)
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
         transferLabel = "Подготовка выгрузки в Google Drive"
         defer {
             busy = false
             transferLabel = ""
             transferProgress = 0
             transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
         }
         do {
-            for (index, file) in pending.enumerated() {
-                transferLabel = "Выгружаю медиа: \(index + 1) из \(pending.count)"
-                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
-                transferLabel = "Выгружено \(index + 1) из \(pending.count). Создаю миниатюру в фоне…"
+            for (index, file) in localFiles.enumerated() {
+                if !file.uploaded {
+                    transferLabel = "Выгружаю медиа: \(index + 1) из \(localFiles.count)"
+                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+                        self.transferBytes = sent
+                        self.transferExpectedBytes = total
+                        self.transferSpeedBytesPerSecond = speed
+                    }
+                }
+                transferLabel = "Создаю квадратную миниатюру: \(index + 1) из \(localFiles.count)"
                 let thumb = try await Task.detached(priority: .utility) {
                     try self.makeEncryptedThumbnail(for: file.url)
                 }.value
                 if let thumb {
-                    transferLabel = "Передаю миниатюру: \(index + 1) из \(pending.count)"
-                    try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
+                    transferLabel = "Передаю миниатюру: \(index + 1) из \(localFiles.count)"
+                    try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
                 transferProgress = index + 1
+                transferBytes = 0
+                transferExpectedBytes = 0
+                transferSpeedBytesPerSecond = 0
             }
             refreshFiles()
-            message = pending.isEmpty ? "Все файлы уже выгружены." : "Выгрузка завершена: \(pending.count) файлов."
+            message = localFiles.isEmpty
+                ? "Все файлы уже синхронизированы."
+                : "Синхронизация завершена: обновлено миниатюр — \(localFiles.count), новых файлов — \(pending.count)."
         } catch { message = "Ошибка Google Drive: \(error.localizedDescription)" }
     }
 
@@ -2590,7 +2598,16 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         try await Task.detached(priority: .utility) {
             try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
         }.value
-        try await upload(encryptedFile, progress: progress)
+        let originalSize = Int64((try? plaintextFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        try await upload(encryptedFile) { sent, total, speed in
+            guard total > 0, originalSize > 0 else {
+                progress(sent, originalSize, speed)
+                return
+            }
+            let fraction = min(1.0, max(0.0, Double(sent) / Double(total)))
+            progress(Int64(Double(originalSize) * fraction), originalSize,
+                     speed * Double(originalSize) / Double(total))
+        }
         var map = fileIDs
         map[plaintextFile.lastPathComponent] = map.removeValue(forKey: encryptedFile.lastPathComponent)
         fileIDs = map
