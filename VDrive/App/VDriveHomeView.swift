@@ -46,7 +46,7 @@ private struct VaultFile: Identifiable, Hashable {
     var addedDate: Date {
         let parts = id.components(separatedBy: "__")
         if parts.count > 3, parts[1].hasPrefix("A"),
-           let timestamp = Int(parts[1].dropFirst()) {
+           let timestamp = Double(parts[1].dropFirst()) {
             return Date(timeIntervalSince1970: TimeInterval(timestamp))
         }
         return (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
@@ -55,7 +55,7 @@ private struct VaultFile: Identifiable, Hashable {
     var captureDate: Date? {
         let parts = id.components(separatedBy: "__")
         guard parts.count > 3, parts[2].hasPrefix("C"),
-              let timestamp = Int(parts[2].dropFirst()), timestamp > 0 else { return nil }
+              let timestamp = Double(parts[2].dropFirst()), timestamp > 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
     }
 }
@@ -1639,11 +1639,19 @@ struct VDriveHomeView: View {
         }
     }
 
+    private func previewCompatibleURL(for file: VaultFile) throws -> URL {
+        let safeName = URL(fileURLWithPath: file.displayName).lastPathComponent
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-preview-\(UUID().uuidString)-\(safeName)")
+        do {
+            try FileManager.default.linkItem(at: file.url, to: temp)
+        } catch {
+            try FileManager.default.copyItem(at: file.url, to: temp)
+        }
+        return temp
+    }
+
     private func decryptedTemporaryURL(for file: VaultFile) throws -> URL {
-        let rawName = file.url.deletingPathExtension().lastPathComponent
-        let pieces = rawName.components(separatedBy: "__")
-        let originalName = pieces.count > 1 ? pieces.dropFirst().joined(separator: "__") : rawName
-        let safeName = originalName.isEmpty ? "VDrive-file.bin" : originalName
+        let safeName = URL(fileURLWithPath: file.displayName).lastPathComponent
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-\(UUID().uuidString)-\(safeName)")
         let size = (try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if isClearlyPlaintextFile(file.url) || size > 256 * 1024 * 1024 {
@@ -1669,7 +1677,7 @@ struct VDriveHomeView: View {
             let currentFiles = sortedFiles.filter { $0.isLocal }
             var temporaryURLs: [URL] = []
             let urls = try currentFiles.map { current -> URL in
-                if isClearlyPlaintextFile(current.url) { return current.url }
+                if isClearlyPlaintextFile(current.url) { return try previewCompatibleURL(for: current) }
                 let temp = try decryptedTemporaryURL(for: current)
                 temporaryURLs.append(temp)
                 return temp
@@ -2663,8 +2671,8 @@ private struct VaultFullscreenViewer: View {
     @State private var controlsVisible = true
 
     private var current: PreviewItem? { items.indices.contains(index) ? items[index] : nil }
-    private var isVideo: Bool { current.flatMap { UTType(filenameExtension: $0.url.pathExtension)?.conforms(to: .movie) } ?? false }
-    private var isImage: Bool { current.flatMap { UTType(filenameExtension: $0.url.pathExtension)?.conforms(to: .image) } ?? false }
+    private var isVideo: Bool { current.flatMap { UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .movie) } ?? false }
+    private var isImage: Bool { current.flatMap { UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) } ?? false }
 
     var body: some View {
         ZStack {
@@ -2749,7 +2757,7 @@ private struct VaultFullscreenViewer: View {
         isPlaying = false
         playhead = 0
         duration = 0
-        guard let current, UTType(filenameExtension: current.url.pathExtension)?.conforms(to: .movie) == true else { return }
+        guard let current, UTType(filenameExtension: URL(fileURLWithPath: current.name).pathExtension)?.conforms(to: .movie) == true else { return }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [])
             try AVAudioSession.sharedInstance().setActive(true)
