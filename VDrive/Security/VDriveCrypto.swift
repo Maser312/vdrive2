@@ -217,8 +217,12 @@ extension VDriveCrypto {
         defer { try? input.close() }
         let first = try readExactly(fileMagic.count, from: input)
         guard first == fileMagic else {
-            // Older VDrive versions encrypted the complete file as one AES-GCM box.
-            // This compatibility path is intentionally isolated; new uploads use chunks.
+            // Legacy AES-GCM is a single authenticated box and cannot be streamed.
+            // Refuse very large legacy blobs rather than allocating their full size and freezing the device.
+            let legacySize = (try? source.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard legacySize <= 256 * 1024 * 1024 else {
+                throw cryptoError(-1, "Это старый облачный файл размером больше 256 МБ. Его нельзя безопасно расшифровать на этом устройстве без риска зависания. Нужна повторная загрузка исходника в новом потоковом формате.")
+            }
             let legacy = try Data(contentsOf: source, options: [.mappedIfSafe])
             let plaintext = try open(legacy, key: key)
             try plaintext.write(to: destination, options: [.atomic, .completeFileProtection])
