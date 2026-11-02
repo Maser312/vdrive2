@@ -1466,6 +1466,45 @@ struct VDriveHomeView: View {
         return try VDriveCrypto.seal(jpeg, key: VDriveCrypto.localKey())
     }
 
+    private func metadataCaptureDate(at url: URL, filename: String) async -> Date? {
+        await Task.detached(priority: .utility) {
+            let ext = (filename as NSString).pathExtension.lowercased()
+            let imageTypes = ["jpg", "jpeg", "heic", "heif", "tif", "tiff", "png", "webp"]
+            if imageTypes.contains(ext),
+               let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
+                let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any]
+                let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+                let raw = (exif?[kCGImagePropertyExifDateTimeOriginal] as? String)
+                    ?? (exif?[kCGImagePropertyExifDateTimeDigitized] as? String)
+                    ?? (tiff?[kCGImagePropertyTIFFDateTime] as? String)
+                if let raw {
+                    let formatter = DateFormatter()
+                    formatter.locale = Locale(identifier: "en_US_POSIX")
+                    formatter.timeZone = .current
+                    formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                    if let date = formatter.date(from: raw) { return date }
+                }
+            }
+
+            let videoTypes = ["mov", "mp4", "m4v", "3gp", "avi", "mkv"]
+            if videoTypes.contains(ext) {
+                let asset = AVURLAsset(url: url)
+                if let metadata = try? await asset.load(.commonMetadata),
+                   let item = metadata.first(where: { $0.commonKey == .commonKeyCreationDate }) {
+                    if let date = item.dateValue { return date }
+                    if let value = item.stringValue {
+                        let iso = ISO8601DateFormatter()
+                        if let date = iso.date(from: value) { return date }
+                        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                        if let date = iso.date(from: value) { return date }
+                    }
+                }
+            }
+            return nil
+        }.value
+    }
+
     @MainActor private func showFileProperties(_ file: VaultFile) async {
         guard file.isLocal else {
             let ext = (file.displayName as NSString).pathExtension
@@ -1481,7 +1520,7 @@ struct VDriveHomeView: View {
         let fileURL = file.url
         let displayName = file.displayName
         let addedDate = file.addedDate
-        let captureDate = file.captureDate
+        let captureDate = file.captureDate ?? await metadataCaptureDate(at: fileURL, filename: displayName)
         do {
             let details = try await Task.detached(priority: .utility) { () throws -> String in
                 let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
