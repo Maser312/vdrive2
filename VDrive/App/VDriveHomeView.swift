@@ -445,6 +445,44 @@ struct VDriveHomeView: View {
 
     private let pinKey = "vdrive.pin"
 
+    private var transferStatusPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text(transferLabel.isEmpty ? "Обработка файла…" : transferLabel)
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(2)
+                Spacer(minLength: 6)
+                if transferExpectedBytes > 0 {
+                    Text(String(format: "%.2f / %.2f MB", Double(transferBytes) / 1_000_000, Double(transferExpectedBytes) / 1_000_000))
+                        .font(.caption.monospacedDigit().weight(.medium))
+                } else if transferTotal > 0 {
+                    Text("\(transferProgress) / \(transferTotal)")
+                        .font(.caption.monospacedDigit().weight(.medium))
+                }
+            }
+            if transferExpectedBytes > 0 {
+                ProgressView(value: Double(min(max(transferBytes, 0), transferExpectedBytes)), total: Double(max(transferExpectedBytes, 1)))
+                    .tint(.primary)
+                HStack {
+                    Text("\(Int(min(100, max(0, Double(transferBytes) / Double(max(transferExpectedBytes, 1)) * 100))) )%")
+                    Spacer()
+                    Text(String(format: "%.2f MB/s", transferSpeedBytesPerSecond / 1_000_000))
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            } else if transferTotal > 0 {
+                ProgressView(value: Double(min(transferProgress, transferTotal)), total: Double(transferTotal)).tint(.primary)
+            } else {
+                ProgressView().tint(.primary)
+            }
+        }
+        .padding(13)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(.white.opacity(0.18), lineWidth: 1))
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
+    }
+
     var body: some View {
         mainContent
             .task {
@@ -462,6 +500,9 @@ struct VDriveHomeView: View {
         }
         .onAppear { flipMotion.start() }
         .onDisappear { flipMotion.stop() }
+        .overlay(alignment: .bottom) {
+            if busy { transferStatusPanel.padding(.horizontal, 12).padding(.bottom, 10).transition(.move(edge: .bottom).combined(with: .opacity)).zIndex(100) }
+        }
         .onChange(of: selection) { _, items in Task { await importItems(items) } }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .sheet(isPresented: $showingFileImporter) {
@@ -819,42 +860,6 @@ struct VDriveHomeView: View {
                 ScrollView {
                     VStack(spacing: 10) {
                         Color.clear.frame(height: 124)
-
-                        if busy {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                    Text(transferLabel.isEmpty ? "Обработка медиа…" : transferLabel)
-                                        .font(.footnote.weight(.medium))
-                                        .lineLimit(2)
-                                    Spacer(minLength: 4)
-                                    if transferExpectedBytes > 0 {
-                                        Text("\(ByteCountFormatter.string(fromByteCount: transferBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: transferExpectedBytes, countStyle: .file))")
-                                            .font(.caption.monospacedDigit())
-                                            .foregroundStyle(.secondary)
-                                    } else if transferTotal > 0 {
-                                        Text("\(transferProgress)/\(transferTotal)")
-                                            .font(.caption.monospacedDigit())
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                if transferExpectedBytes > 0 {
-                                    ProgressView(value: Double(min(transferBytes, transferExpectedBytes)), total: Double(transferExpectedBytes)).tint(.primary)
-                                    HStack {
-                                        Text("\(Int(Double(transferBytes) / Double(max(transferExpectedBytes, 1)) * 100))%")
-                                        Spacer()
-                                        Text("\(ByteCountFormatter.string(fromByteCount: Int64(transferSpeedBytesPerSecond), countStyle: .file))/с")
-                                    }.font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                                } else if transferTotal > 0 {
-                                    ProgressView(value: Double(min(transferProgress, transferTotal)), total: Double(transferTotal)).tint(.primary)
-                                } else { ProgressView() }
-                            }
-                            .padding(12)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-                            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.16), lineWidth: 1))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 4)
-                        }
 
                         if files.isEmpty {
                             ContentUnavailableView(
