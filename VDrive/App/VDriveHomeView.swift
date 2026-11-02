@@ -348,7 +348,7 @@ private struct VaultThumbnail: View {
         guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
         return renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / mediaImage.size.width, 320 / mediaImage.size.height)
+            let scale = max(320 / mediaImage.size.width, 320 / mediaImage.size.height)
             let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
             mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
         }
@@ -411,6 +411,10 @@ struct VDriveHomeView: View {
     @State private var transferProgress = 0
     @State private var transferTotal = 0
     @State private var transferLabel = ""
+    @State private var transferBytes: Int64 = 0
+    @State private var transferExpectedBytes: Int64 = 0
+    @State private var transferSpeedBytesPerSecond: Double = 0
+    @State private var autoConnectAttempted = false
     @State private var locked = true
     @State private var showingAuthenticator = true
     @State private var localStorageBytes: Int64 = 0
@@ -467,6 +471,12 @@ struct VDriveHomeView: View {
         .onAppear { flipMotion.start() }
         .onDisappear { flipMotion.stop() }
         .onChange(of: selection) { _, items in Task { await importItems(items) } }
+        .onChange(of: locked) { _, isLocked in
+            if !isLocked { Task { await autoConnectGoogleIfNeeded() } }
+        }
+        .onChange(of: showingAuthenticator) { _, isShowing in
+            if !isShowing && !locked { Task { await autoConnectGoogleIfNeeded() } }
+        }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .sheet(isPresented: $showingFileImporter) {
             FileImportPicker { result in
@@ -2017,6 +2027,12 @@ struct VDriveHomeView: View {
             VDriveDiagnosticLog.shared.write("ERROR", "Массовое скачивание: \(error.localizedDescription)")
             message = "Ошибка скачивания: \(error.localizedDescription)"
         }
+    }
+
+    @MainActor private func autoConnectGoogleIfNeeded() async {
+        guard !autoConnectAttempted, GoogleDriveStore.shared.hasRefreshToken else { return }
+        autoConnectAttempted = true
+        await connectGoogle()
     }
 
     @MainActor private func connectGoogle() async {
