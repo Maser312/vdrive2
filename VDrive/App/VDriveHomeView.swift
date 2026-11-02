@@ -1520,7 +1520,12 @@ struct VDriveHomeView: View {
         let fileURL = file.url
         let displayName = file.displayName
         let addedDate = file.addedDate
-        let captureDate = file.captureDate ?? await metadataCaptureDate(at: fileURL, filename: displayName)
+        let captureDate: Date?
+        if let storedCaptureDate = file.captureDate {
+            captureDate = storedCaptureDate
+        } else {
+            captureDate = await metadataCaptureDate(at: fileURL, filename: displayName)
+        }
         do {
             let details = try await Task.detached(priority: .utility) { () throws -> String in
                 let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
