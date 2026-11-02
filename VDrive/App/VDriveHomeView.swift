@@ -2253,6 +2253,8 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
     private var lastBytes: Int64 = 0
     private var lastDate = Date()
     private var speed: Double = 0
+    private var receivedDownloadBytes: Int64 = 0
+    private var expectedDownloadBytes: Int64 = 0
 
     init(progress: @escaping (Int64, Int64, Double) -> Void) {
         self.progress = progress
@@ -2287,6 +2289,8 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
         try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             responseData = Data()
+            receivedDownloadBytes = 0
+            expectedDownloadBytes = 0
             lastBytes = 0
             lastDate = Date()
             lastReport = .distantPast
@@ -2297,7 +2301,11 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         if let outputHandle {
-            do { try outputHandle.write(contentsOf: data) } catch { dataTask.cancel() }
+            do {
+                try outputHandle.write(contentsOf: data)
+                receivedDownloadBytes += Int64(data.count)
+                report(receivedDownloadBytes, expectedDownloadBytes)
+            } catch { dataTask.cancel() }
         } else { responseData.append(data) }
     }
 
@@ -2306,9 +2314,14 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        if outputHandle != nil, let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            completionHandler(.cancel)
-        } else { completionHandler(.allow) }
+        if outputHandle != nil {
+            expectedDownloadBytes = response.expectedContentLength
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                completionHandler(.cancel)
+                return
+            }
+        }
+        completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
