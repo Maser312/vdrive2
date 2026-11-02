@@ -688,7 +688,7 @@ struct VDriveHomeView: View {
                 Image(systemName: "doc.on.doc").font(.system(size: 15, weight: .semibold))
                     .frame(width: 38, height: 38).glassEffect(.regular.interactive(), in: Circle())
             }
-            .buttonStyle(.plain).accessibilityLabel("Скопировать демонстрационный код \\(service)")
+            .buttonStyle(.plain).accessibilityLabel("Скопировать демонстрационный код \(service)")
         }
         .foregroundStyle(.primary)
         .padding(14)
@@ -1224,7 +1224,7 @@ struct VDriveHomeView: View {
                         .onChange(of: diagnosticLoggingEnabled) { _, enabled in VDriveDiagnosticLog.shared.setEnabled(enabled) }
                     Button("Выгрузить журнал", systemImage: "square.and.arrow.up") {
                         do { let url = try VDriveDiagnosticLog.shared.export(); shareURL = url; exportToFiles = false; showingShareSheet = true }
-                        catch { message = "Не удалось подготовить журнал: \\(error.localizedDescription)" }
+                        catch { message = "Не удалось подготовить журнал: \(error.localizedDescription)" }
                     }
                     Text("Записываются этапы операций, время, размеры файлов, сетевые статусы и ошибки. Пароли, токены, ключ шифрования и содержимое файлов не записываются.")
                         .font(.footnote).foregroundStyle(.secondary)
@@ -2000,7 +2000,7 @@ struct VDriveHomeView: View {
         }
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())\n            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\\(count)")
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())\n            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
             transferProgress = count
             transferTotal = max(count, 1)
             transferLabel = "Загрузка из Google Drive завершена"
@@ -2230,9 +2230,10 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "access_type", value: "offline"),
+            URLQueryItem(name: "include_granted_scopes", value: "true")
         ]
         guard let authURL = components.url else { throw DriveError.invalidResponse }
-        VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \\(hasRefreshToken)")\n        let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+        VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \(hasRefreshToken)")\n        let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: scheme) { url, error in
                 if let error { continuation.resume(throwing: error); return }
                 guard let url else { continuation.resume(throwing: DriveError.invalidResponse); return }
@@ -2266,7 +2267,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         let token = try JSONDecoder().decode(TokenResponse.self, from: data)
         accessToken = token.access_token
         if let refresh = token.refresh_token, !refresh.isEmpty { try saveKeychain(refresh) }
-        VDriveDiagnosticLog.shared.write("AUTH", "OAuth завершён; refresh token сохранён: \\(hasRefreshToken)")
+        VDriveDiagnosticLog.shared.write("AUTH", "OAuth завершён; refresh token сохранён: \(hasRefreshToken)")
     }
 
     func fetchCloudKeyRecord() async throws -> Data? {
@@ -2490,37 +2491,37 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
 
     func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey) async throws {
         let started = Date()
-        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Начало; driveID=\\(driveID.prefix(8)); extension=\\((name as NSString).pathExtension)")
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Начало; driveID=\(driveID.prefix(8)); extension=\((name as NSString).pathExtension)")
         try await ensureAccessToken()
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
         let (downloadedURL, response) = try await URLSession.shared.download(for: request)
         let downloadedBytes = (try? downloadedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Ответ Drive; HTTP=\\(status); bytes=\\(downloadedBytes); seconds=\\(String(format: "%.2f", Date().timeIntervalSince(started)))")
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Ответ Drive; HTTP=\(status); bytes=\(downloadedBytes); seconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             try? FileManager.default.removeItem(at: downloadedURL)
-            VDriveDiagnosticLog.shared.write("ERROR", "HTTP ошибка скачивания; status=\\(status)")
+            VDriveDiagnosticLog.shared.write("ERROR", "HTTP ошибка скачивания; status=\(status)")
             throw DriveError.server("Не удалось скачать " + name)
         }
         let destination = directory.appendingPathComponent(name)
         let staging = directory.appendingPathComponent("." + UUID().uuidString + ".vdrive-part")
         defer { try? FileManager.default.removeItem(at: downloadedURL); try? FileManager.default.removeItem(at: staging) }
-        VDriveDiagnosticLog.shared.write("DECRYPT", "Начало; bytes=\\(downloadedBytes)")
+        VDriveDiagnosticLog.shared.write("DECRYPT", "Начало; bytes=\(downloadedBytes)")
         do {
             try await Task.detached(priority: .utility) { try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key) }.value
         } catch {
-            VDriveDiagnosticLog.shared.write("ERROR", "Расшифровка: \\(error.localizedDescription)")
+            VDriveDiagnosticLog.shared.write("ERROR", "Расшифровка: \(error.localizedDescription)")
             throw error
         }
-        VDriveDiagnosticLog.shared.write("DECRYPT", "Завершено; seconds=\\(String(format: "%.2f", Date().timeIntervalSince(started)))")
+        VDriveDiagnosticLog.shared.write("DECRYPT", "Завершено; seconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
         if FileManager.default.fileExists(atPath: destination.path) {
             _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
         } else {
             try FileManager.default.moveItem(at: staging, to: destination)
         }
         VDriveCrypto.markLocalPlaintextFile(destination)
-        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Сохранено; localBytes=\\((try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0); totalSeconds=\\(String(format: "%.2f", Date().timeIntervalSince(started)))")
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Сохранено; localBytes=\((try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0); totalSeconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
     }
 
     func downloadThumbnail(named name: String) async throws -> Data? {
@@ -2674,8 +2675,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             throw DriveError.server(String(data: data, encoding: .utf8) ?? "Token refresh error")
         }
         accessToken = try JSONDecoder().decode(TokenResponse.self, from: data).access_token
-        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \\(http.statusCode)")
-        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \\(http.statusCode)")
+        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \(http.statusCode)")
+        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \(http.statusCode)")
     }
 
     private func readKeychain() -> String? {
