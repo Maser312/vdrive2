@@ -1136,11 +1136,13 @@ struct VDriveHomeView: View {
         do {
             for (index, file) in targets.enumerated() {
                 transferLabel = "Выгружаю файл \(index + 1) из \(targets.count)"
-                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), progress: { sent, total, speed in
                     self.transferBytes = sent
                     self.transferExpectedBytes = total
                     self.transferSpeedBytesPerSecond = speed
-                }
+                }, phase: { stage in
+                    self.transferLabel = stage
+                })
                 if let thumb = try self.makeEncryptedThumbnail(for: file.url) {
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
@@ -1178,11 +1180,13 @@ struct VDriveHomeView: View {
             for (index, file) in targets.enumerated() {
                 guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { continue }
                 transferLabel = "Скачиваю файл \(index + 1) из \(targets.count)"
-                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey()) { received, total, speed in
+                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), progress: { received, total, speed in
                     self.transferBytes = received
                     self.transferExpectedBytes = total
                     self.transferSpeedBytesPerSecond = speed
-                }
+                }, phase: { stage in
+                    self.transferLabel = stage
+                })
                 transferProgress = index + 1
                 transferBytes = 0
                 transferExpectedBytes = 0
@@ -1938,11 +1942,13 @@ struct VDriveHomeView: View {
             transferSpeedBytesPerSecond = 0
         }
         do {
-            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), progress: { sent, total, speed in
                 self.transferBytes = sent
                 self.transferExpectedBytes = total
                 self.transferSpeedBytesPerSecond = speed
-            }
+            }, phase: { stage in
+                self.transferLabel = stage
+            })
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
             let thumb = try await Task.detached(priority: .utility) {
@@ -1978,11 +1984,13 @@ struct VDriveHomeView: View {
             transferSpeedBytesPerSecond = 0
         }
         do {
-            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey()) { received, total, speed in
+            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), progress: { received, total, speed in
                 self.transferBytes = received
                 self.transferExpectedBytes = total
                 self.transferSpeedBytesPerSecond = speed
-            }
+            }, phase: { stage in
+                self.transferLabel = stage
+            })
             transferProgress = 1
             refreshFiles()
             message = "Файл скачан на устройство."
@@ -2060,11 +2068,13 @@ struct VDriveHomeView: View {
             for (index, file) in localFiles.enumerated() {
                 if !file.uploaded {
                     transferLabel = "Выгружаю медиа: \(index + 1) из \(localFiles.count)"
-                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), progress: { sent, total, speed in
                         self.transferBytes = sent
                         self.transferExpectedBytes = total
                         self.transferSpeedBytesPerSecond = speed
-                    }
+                    }, phase: { stage in
+                        self.transferLabel = stage
+                    })
                 }
                 transferLabel = "Создаю квадратную миниатюру: \(index + 1) из \(localFiles.count)"
                 let thumb = try await Task.detached(priority: .utility) {
