@@ -1698,7 +1698,7 @@ struct VDriveHomeView: View {
             return temp
         }
         guard let keyData = VDriveCrypto.existingLocalKeyData() else {
-            throw VDriveCryptoError.missingLocalKey
+            throw NSError(domain: "VDrive", code: -1, userInfo: [NSLocalizedDescriptionKey: "На устройстве нет ключа для расшифровки этого файла."])
         }
         do {
             try VDriveCrypto.decryptFile(at: file.url, to: temp, key: SymmetricKey(data: keyData))
