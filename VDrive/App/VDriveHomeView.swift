@@ -1993,7 +1993,7 @@ struct VDriveHomeView: View {
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
             let thumb = try await Task.detached(priority: .utility) {
-                try self.makeEncryptedThumbnail(for: file.url)
+                try await self.makeEncryptedThumbnail(for: file.url)
             }.value
             if let thumb {
                 try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
