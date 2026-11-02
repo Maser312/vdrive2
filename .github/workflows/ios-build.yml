@@ -47,3 +47,5 @@ jobs:
           path: VDrive-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
+
+# Build trigger refresh: 2026-11-03
