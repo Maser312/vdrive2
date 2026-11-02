@@ -1891,6 +1891,7 @@ struct VDriveHomeView: View {
     }
 
     @MainActor private func downloadFile(_ file: VaultFile) async {
+        guard !busy else { message = "Дождись завершения текущей операции."; return }
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         guard !file.isLocal, let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return }
         busy = true
@@ -1908,7 +1909,10 @@ struct VDriveHomeView: View {
             transferProgress = 1
             refreshFiles()
             message = "Файл скачан на устройство."
-        } catch { message = "Не удалось скачать файл: \(error.localizedDescription)" }
+        } catch {
+            VDriveDiagnosticLog.shared.write("ERROR", "Скачивание \(file.id): \(error.localizedDescription)")
+            message = "Не удалось скачать файл: \(error.localizedDescription)"
+        }
     }
 
     @MainActor private func downloadAndOpen(_ file: VaultFile) async {
@@ -1986,6 +1990,7 @@ struct VDriveHomeView: View {
     }
 
     @MainActor private func downloadMissing() async {
+        guard !busy else { message = "Дождись завершения текущей операции."; return }
         VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
@@ -2008,12 +2013,16 @@ struct VDriveHomeView: View {
             transferLabel = "Загрузка из Google Drive завершена"
             refreshFiles()
             message = count == 0 ? "Все облачные файлы уже на устройстве." : "Скачано с Google Drive: \(count)"
-        } catch { message = "Ошибка скачивания: \(error.localizedDescription)" }
+        } catch {
+            VDriveDiagnosticLog.shared.write("ERROR", "Массовое скачивание: \(error.localizedDescription)")
+            message = "Ошибка скачивания: \(error.localizedDescription)"
+        }
     }
 
     @MainActor private func connectGoogle() async {
-        let clientID = clientIDInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clientID.isEmpty else { showGoogleSetupInfo = true; return }
+        let clientID = clientIDInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (UserDefaults.standard.string(forKey: "googleClientID") ?? "15564278108-3npmd22j8obehjl19rpbpeeldlg2bn3k.apps.googleusercontent.com")
+            : clientIDInput.trimmingCharacters(in: .whitespacesAndNewlines)
         UserDefaults.standard.set(clientID, forKey: "googleClientID")
         do {
             try await GoogleDriveStore.shared.connect(clientID: clientID)
