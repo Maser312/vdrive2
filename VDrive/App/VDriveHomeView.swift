@@ -222,7 +222,7 @@ private struct VaultThumbnail: View {
             let url = file.url
             let name = file.displayName
             let jpeg = await Task.detached(priority: .utility) { () -> Data? in
-                if let direct = Self.makeJPEGThumbnail(fromFileURL: url, filename: name) { return direct }
+                if let direct = await Self.makeJPEGThumbnailAsync(fromFileURL: url, filename: name) { return direct }
                 let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                 guard size <= 256 * 1024 * 1024,
                       let stored = try? Data(contentsOf: url, options: [.mappedIfSafe]),
@@ -304,6 +304,47 @@ private struct VaultThumbnail: View {
         try? FileManager.default.removeItem(at: localThumbnailURL(for: fileID))
         try? FileManager.default.removeItem(at: thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".vthumb"))
         try? FileManager.default.removeItem(at: legacyLocalThumbnailURL(for: fileID))
+    }
+
+    nonisolated static func makeJPEGThumbnailAsync(fromFileURL url: URL, filename: String) async -> Data? {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv", "3gp", "3g2"]
+        let mediaImage: UIImage?
+        if videoExtensions.contains(ext) {
+            let asset = AVURLAsset(url: url)
+            do {
+                guard try await asset.load(.isPlayable) else { return nil }
+                let duration = try await asset.load(.duration)
+                let seconds = duration.isNumeric && duration.seconds.isFinite ? max(0, min(1.0, duration.seconds * 0.1)) : 0.5
+                let generator = AVAssetImageGenerator(asset: asset)
+                generator.appliesPreferredTrackTransform = true
+                generator.maximumSize = CGSize(width: 640, height: 640)
+                generator.requestedTimeToleranceBefore = CMTime(seconds: 2, preferredTimescale: 600)
+                generator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
+                let frame = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
+                mediaImage = UIImage(cgImage: frame)
+            } catch {
+                VDriveDiagnosticLog.shared.write("THUMB", "Video thumbnail failed: \(error.localizedDescription)")
+                return nil
+            }
+        } else {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            mediaImage = UIImage(cgImage: thumbnail)
+        }
+        guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
+        return renderer.jpegData(withCompressionQuality: 0.68) { _ in
+            let scale = max(320 / mediaImage.size.width, 320 / mediaImage.size.height)
+            let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
+            mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
+        }
     }
 
     nonisolated static func makeJPEGThumbnail(from data: Data, filename: String) -> Data? {
@@ -1143,7 +1184,7 @@ struct VDriveHomeView: View {
                 }, phase: { stage in
                     self.transferLabel = stage
                 })
-                if let thumb = try self.makeEncryptedThumbnail(for: file.url) {
+                if let thumb = try await self.makeEncryptedThumbnail(for: file.url) {
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
                 transferProgress = index + 1
@@ -1414,7 +1455,7 @@ struct VDriveHomeView: View {
                     }.value
                     VDriveCrypto.markLocalPlaintextFile(url)
                     if let jpeg = await Task.detached(priority: .utility, operation: {
-                        VaultThumbnail.makeJPEGThumbnail(fromFileURL: url, filename: "media." + ext)
+                        await VaultThumbnail.makeJPEGThumbnailAsync(fromFileURL: url, filename: "media." + ext)
                     }).value {
                         try? await Task.detached(priority: .utility) {
                             try VaultThumbnail.saveLocalThumbnail(jpeg, for: name)
@@ -1527,7 +1568,7 @@ struct VDriveHomeView: View {
                     continue
                 }
                 if let jpeg = await Task.detached(priority: .utility, operation: {
-                    VaultThumbnail.makeJPEGThumbnail(fromFileURL: destination, filename: safeName)
+                    await VaultThumbnail.makeJPEGThumbnailAsync(fromFileURL: destination, filename: safeName)
                 }).value {
                     try? await Task.detached(priority: .utility) {
                         try VaultThumbnail.saveLocalThumbnail(jpeg, for: name)
@@ -1573,10 +1614,10 @@ struct VDriveHomeView: View {
         if let copyError { throw copyError }
     }
 
-    nonisolated private func makeEncryptedThumbnail(for localFile: URL) throws -> Data? {
+    nonisolated private func makeEncryptedThumbnail(for localFile: URL) async throws -> Data? {
         let rawName = localFile.deletingPathExtension().lastPathComponent
         let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
-        guard let jpeg = VaultThumbnail.makeJPEGThumbnail(fromFileURL: localFile, filename: mediaName) else { return nil }
+        guard let jpeg = await VaultThumbnail.makeJPEGThumbnailAsync(fromFileURL: localFile, filename: mediaName) else { return nil }
         return try VDriveCrypto.seal(jpeg, key: VDriveCrypto.localKey())
     }
 
