@@ -2194,6 +2194,20 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
     private let mapKey = "vdrive.google.fileMap"
     private var clientID = ""
     private var accessToken = ""
+    private let downloadLock = NSLock()
+    private var activeDownloadIDs = Set<String>()
+    private func beginDownload(_ id: String) -> Bool {
+        downloadLock.lock()
+        defer { downloadLock.unlock() }
+        guard !activeDownloadIDs.contains(id) else { return false }
+        activeDownloadIDs.insert(id)
+        return true
+    }
+    private func endDownload(_ id: String) {
+        downloadLock.lock()
+        activeDownloadIDs.remove(id)
+        downloadLock.unlock()
+    }
     var fileIDs: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: mapKey) as? [String: String] ?? [:] }
         set { UserDefaults.standard.set(newValue, forKey: mapKey) }
@@ -2216,6 +2230,16 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
 
     func connect(clientID: String) async throws {
         self.clientID = clientID
+        if hasRefreshToken {
+            do {
+                try await ensureAccessToken()
+                VDriveDiagnosticLog.shared.write("AUTH", "Существующая Google-сессия восстановлена из Keychain; OAuth экран не открывался")
+                return
+            } catch {
+                accessToken = ""
+                VDriveDiagnosticLog.shared.write("AUTH", "Сохранённый refresh token недействителен; потребуется повторная авторизация")
+            }
+        }
         let prefix = clientID.replacingOccurrences(of: ".apps.googleusercontent.com", with: "")
         let scheme = "com.googleusercontent.apps.\(prefix)"
         let redirect = "\(scheme):/oauth2redirect"
@@ -2496,7 +2520,39 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
     func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey) async throws {
         let started = Date()
         VDriveDiagnosticLog.shared.write("DOWNLOAD", "Начало; driveID=\(driveID.prefix(8)); extension=\((name as NSString).pathExtension)")
+        guard beginDownload(driveID) else {
+            VDriveDiagnosticLog.shared.write("DOWNLOAD", "Повторный запрос пропущен: файл уже скачивается; id=\(driveID.prefix(8))")
+            throw DriveError.server("Этот файл уже скачивается. Дождись завершения текущей загрузки.")
+        }
+        defer { endDownload(driveID) }
         try await ensureAccessToken()
+        let metadataURL = URL(string: "https://www.googleapis.com/drive/v3/files/\(driveID)?fields=size")!
+        var metadataRequest = URLRequest(url: metadataURL)
+        metadataRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        let (metadataData, metadataResponse) = try await URLSession.shared.data(for: metadataRequest)
+        guard let metadataHTTP = metadataResponse as? HTTPURLResponse, (200..<300).contains(metadataHTTP.statusCode) else {
+            throw DriveError.server("Не удалось проверить размер файла перед скачиванием.")
+        }
+        let metadata = try JSONDecoder().decode(DriveFileMetadata.self, from: metadataData)
+        let remoteSize = Int64(metadata.size ?? "") ?? 0
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Метаданные получены; bytes=\(remoteSize)")
+        if remoteSize > 256 * 1024 * 1024 {
+            var rangeRequest = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(driveID)?alt=media")!)
+            rangeRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            rangeRequest.setValue("bytes=0-7", forHTTPHeaderField: "Range")
+            let (rangeURL, rangeResponse) = try await URLSession.shared.download(for: rangeRequest)
+            defer { try? FileManager.default.removeItem(at: rangeURL) }
+            guard let rangeHTTP = rangeResponse as? HTTPURLResponse, rangeHTTP.statusCode == 206 else {
+                throw DriveError.server("Google Drive не поддержал безопасную проверку формата большого файла. Скачивание отменено.")
+            }
+            let prefix = try Data(contentsOf: rangeURL)
+            guard prefix == Data("VDRCHNK1".utf8) else {
+                VDriveDiagnosticLog.shared.write("DOWNLOAD", "Отмена до полной загрузки: старый монолитный формат; bytes=\(remoteSize)")
+                throw DriveError.server("Старый формат шифрования, файл слишком велик для безопасной загрузки на iPhone (\(ByteCountFormatter.string(fromByteCount: remoteSize, countStyle: .file))). Нужна повторная выгрузка оригинала.")
+            }
+            VDriveDiagnosticLog.shared.write("DOWNLOAD", "Большой файл подтверждён как потоковый формат")
+        }
+
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
         let (downloadedURL, response) = try await URLSession.shared.download(for: request)
@@ -2560,7 +2616,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             URLQueryItem(name: "spaces", value: "drive"),
             URLQueryItem(name: "pageSize", value: "1000"),
             URLQueryItem(name: "q", value: "trashed = false"),
-            URLQueryItem(name: "fields", value: "files(id,name)")
+            URLQueryItem(name: "fields", value: "files(id,name,size)")
         ]
         var listRequest = URLRequest(url: components.url!)
         listRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -2572,34 +2628,23 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         var map = fileIDs
         for item in remote where item.name.hasSuffix(".vdrive") { map[item.name] = item.id }
         fileIDs = map
-        // Re-scan the destination instead of trusting the caller's snapshot.
-        // Restore must never overwrite a file that is already on this device.
         let diskNames = Set(((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "vdrive" }
-            .map { $0.lastPathComponent })
-        let existingNames = localNames.union(diskNames)
+            .filter { $0.pathExtension == "vdrive" }.map { $0.lastPathComponent })
+        var existingNames = localNames.union(diskNames)
+        let pending = remote.filter { $0.name.hasSuffix(".vdrive") && !existingNames.contains($0.name) }
+        VDriveDiagnosticLog.shared.write("SYNC", "Файлов в облаке=\(remote.count); отсутствуют локально=\(pending.count)")
         var count = 0
-        for item in remote where item.name.hasSuffix(".vdrive") && !existingNames.contains(item.name) {
+        for item in pending {
             let destination = directory.appendingPathComponent(item.name)
-            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
-            var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(item.id)?alt=media")!)
-            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            let (downloadedURL, response) = try await URLSession.shared.download(for: request)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                try? FileManager.default.removeItem(at: downloadedURL)
-                throw DriveError.server("Не удалось скачать \(item.name)")
-            }
-            defer { try? FileManager.default.removeItem(at: downloadedURL) }
-            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
-            try await Task.detached(priority: .utility) {
-                try VDriveCrypto.decryptFile(at: downloadedURL, to: destination, key: key)
-            }.value
-            VDriveCrypto.markLocalPlaintextFile(destination)
+            guard !FileManager.default.fileExists(atPath: destination.path) else { existingNames.insert(item.name); continue }
+            VDriveDiagnosticLog.shared.write("SYNC", "Очередь: \(item.name); cloudBytes=\(item.size ?? "unknown")")
+            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key)
+            existingNames.insert(item.name)
             count += 1
+            VDriveDiagnosticLog.shared.write("SYNC", "Завершён файл \(item.name); \(count)/\(pending.count)")
         }
         return count
     }
-
     private func deleteDriveFile(named name: String) async throws {
         try await ensureAccessToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
@@ -2712,6 +2757,7 @@ private struct TokenResponse: Decodable {
     let refresh_token: String?
 }
 private struct DriveFileResponse: Decodable { let id: String; let name: String; let size: String? }
+private struct DriveFileMetadata: Decodable { let size: String? }
 private struct DriveFileList: Decodable { let files: [DriveFileResponse] }
 private struct RemoteFileIDs: Decodable {
     struct Item: Decodable { let id: String }
