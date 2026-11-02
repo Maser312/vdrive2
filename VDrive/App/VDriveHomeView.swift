@@ -2654,10 +2654,14 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: stagingDirectory) }
         let encryptedFile = stagingDirectory.appendingPathComponent(plaintextFile.lastPathComponent)
-        try await Task.detached(priority: .utility) {
-            try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
-        }.value
         let originalSize = Int64((try? plaintextFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        await MainActor.run { progress(0, originalSize, 0) }
+        try await Task.detached(priority: .utility) {
+            try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key) { done, total, speed in
+                DispatchQueue.main.async { progress(done, total, speed) }
+            }
+        }.value
+        await MainActor.run { progress(originalSize, originalSize, 0) }
         try await upload(encryptedFile) { sent, total, speed in
             guard total > 0, originalSize > 0 else {
                 progress(sent, originalSize, speed)
@@ -2823,7 +2827,12 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         defer { try? FileManager.default.removeItem(at: downloadedURL); try? FileManager.default.removeItem(at: staging) }
         VDriveDiagnosticLog.shared.write("DECRYPT", "Начало; bytes=\(downloadedBytes)")
         do {
-            try await Task.detached(priority: .utility) { try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key) }.value
+            progress(0, remoteSize, 0)
+            try await Task.detached(priority: .utility) {
+                try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key) { done, total, speed in
+                    DispatchQueue.main.async { progress(done, total, speed) }
+                }
+            }.value
         } catch {
             VDriveDiagnosticLog.shared.write("ERROR", "Расшифровка: \(error.localizedDescription)")
             throw error
