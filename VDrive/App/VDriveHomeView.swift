@@ -8,9 +8,68 @@ import LocalAuthentication
 import AuthenticationServices
 import AVKit
 import UniformTypeIdentifiers
+import ImageIO
+import CoreTransferable
 import QuickLook
 import CryptoKit
 import Security
+
+
+/// Диагностический журнал VDrive. Содержимое файлов, OAuth-токены и ключи сюда не записываются.
+private final class VDriveDiagnosticLog {
+    static let shared = VDriveDiagnosticLog()
+    private let queue = DispatchQueue(label: "app.vdrive.diagnostics", qos: .utility)
+    private let enabledKey = "vdrive.diagnostics.enabled"
+    private let filename = "VDrive-Diagnostics.log"
+    private init() {}
+    var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+    func setEnabled(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: enabledKey)
+        write("LOG", value ? "Журнал включён" : "Журнал выключен")
+    }
+    private var logURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent(filename)
+    }
+    func write(_ category: String, _ message: String) {
+        guard isEnabled else { return }
+        let line = "\(ISO8601DateFormatter().string(from: Date())) [\(category)] \(message)\n"
+        queue.async {
+            do {
+                try FileManager.default.createDirectory(at: self.logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let data = Data(line.utf8)
+                if FileManager.default.fileExists(atPath: self.logURL.path) {
+                    let handle = try FileHandle(forWritingTo: self.logURL)
+                    try handle.seekToEnd(); try handle.write(contentsOf: data); try handle.close()
+                } else { try data.write(to: self.logURL, options: .completeFileProtection) }
+            } catch { }
+        }
+    }
+    func export() throws -> URL {
+        queue.sync {}
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            try Data("Журнал пока пуст. Включите запись и повторите проблемное действие.".utf8).write(to: logURL, options: .atomic)
+        }
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-Diagnostics-\(Int(Date().timeIntervalSince1970)).log")
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.copyItem(at: logURL, to: destination)
+        return destination
+    }
+}
+
+private struct PickerFileTransfer: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .item) { received in
+            let ext = received.file.pathExtension
+            let temporary = FileManager.default.temporaryDirectory
+                .appendingPathComponent("VDrive-picker-\(UUID().uuidString)")
+                .appendingPathExtension(ext)
+            try FileManager.default.copyItem(at: received.file, to: temporary)
+            return PickerFileTransfer(url: temporary)
+        }
+    }
+}
 
 private struct VaultFile: Identifiable, Hashable {
     let id: String
@@ -29,7 +88,7 @@ private struct VaultFile: Identifiable, Hashable {
     var addedDate: Date {
         let parts = id.components(separatedBy: "__")
         if parts.count > 3, parts[1].hasPrefix("A"),
-           let timestamp = Int(parts[1].dropFirst()) {
+           let timestamp = Double(parts[1].dropFirst()) {
             return Date(timeIntervalSince1970: TimeInterval(timestamp))
         }
         return (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
@@ -38,7 +97,7 @@ private struct VaultFile: Identifiable, Hashable {
     var captureDate: Date? {
         let parts = id.components(separatedBy: "__")
         guard parts.count > 3, parts[2].hasPrefix("C"),
-              let timestamp = Int(parts[2].dropFirst()), timestamp > 0 else { return nil }
+              let timestamp = Double(parts[2].dropFirst()), timestamp > 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(timestamp))
     }
 }
@@ -140,16 +199,20 @@ private struct VaultThumbnail: View {
         let cacheURL = Self.localThumbnailURL(for: file.id)
 
         // Cached previews are encrypted at rest. Only decrypt the tiny JPEG, off the main thread.
-        if let encryptedPreview = try? Data(contentsOf: cacheURL, options: [.mappedIfSafe]) {
-            do {
-                let key = try VDriveCrypto.localKey()
-                let jpeg = try await Task.detached(priority: .utility) {
-                    try await ThumbnailCryptoQueue.shared.decrypt(encryptedPreview, key: key)
-                }.value
-                image = UIImage(data: jpeg)
-                if image != nil { return }
-            } catch {
-                // A legacy plaintext cache or an unreadable cache is handled below.
+        if let cachedPreview = try? Data(contentsOf: cacheURL, options: [.mappedIfSafe]) {
+            if let cachedImage = UIImage(data: cachedPreview) {
+                image = cachedImage
+                return
+            }
+            if let keyData = VDriveCrypto.existingLocalKeyData() {
+                do {
+                    let key = SymmetricKey(data: keyData)
+                    let jpeg = try await Task.detached(priority: .utility) {
+                        try await ThumbnailCryptoQueue.shared.decrypt(cachedPreview, key: key)
+                    }.value
+                    image = UIImage(data: jpeg)
+                    if image != nil { return }
+                } catch { }
             }
         }
 
@@ -170,26 +233,26 @@ private struct VaultThumbnail: View {
         }
 
         if file.isLocal {
-            // One-time generation for files imported before cached thumbnails existed.
-            // The original is read/decrypted only if no preview cache is available.
+            // Build a small preview directly from the local file URL. ImageIO and
+            // AVAsset decode only a thumbnail/frame, not the full-resolution media.
             let url = file.url
             let name = file.displayName
-            do {
-                let jpeg = try await Task.detached(priority: .utility) { () throws -> Data? in
-                    let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
-                    let plain = try VDriveCrypto.open(encrypted, key: VDriveCrypto.localKey())
-                    return Self.makeJPEGThumbnail(from: plain, filename: name)
+            let jpeg = await Task.detached(priority: .utility) { () -> Data? in
+                if let direct = Self.makeJPEGThumbnail(fromFileURL: url, filename: name) { return direct }
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard size <= 256 * 1024 * 1024,
+                      let stored = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+                      let keyData = VDriveCrypto.existingLocalKeyData(),
+                      let legacy = try? VDriveCrypto.open(stored, key: SymmetricKey(data: keyData)) else { return nil }
+                return Self.makeJPEGThumbnail(from: legacy, filename: name)
+            }.value
+            if let jpeg {
+                try? await Task.detached(priority: .utility) {
+                    try Self.saveLocalThumbnail(jpeg, for: file.id)
                 }.value
-                if let jpeg {
-                    try? await Task.detached(priority: .utility) {
-                        try Self.saveLocalThumbnail(jpeg, for: file.id)
-                    }.value
-                    image = UIImage(data: jpeg)
-                }
-                loadFailed = image == nil
-            } catch {
-                loadFailed = true
+                image = UIImage(data: jpeg)
             }
+            loadFailed = image == nil
             return
         }
 
@@ -209,30 +272,34 @@ private struct VaultThumbnail: View {
         let jpeg = try await Task.detached(priority: .utility) {
             try await ThumbnailCryptoQueue.shared.decrypt(encryptedPreview, key: key)
         }.value
-        try? Self.saveEncryptedThumbnail(encryptedPreview, for: file.id)
+        try? Self.saveLocalThumbnail(jpeg, for: file.id)
         return UIImage(data: jpeg)
     }
 
-    static func thumbnailDirectory() -> URL {
+    nonisolated static func thumbnailDirectory() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("VDriveThumbnails", isDirectory: true)
     }
 
-    static func localThumbnailURL(for fileID: String) -> URL {
+    nonisolated static func localThumbnailURL(for fileID: String) -> URL {
         thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".vthumb")
     }
 
-    static func legacyLocalThumbnailURL(for fileID: String) -> URL {
+    nonisolated static func legacyLocalThumbnailURL(for fileID: String) -> URL {
         thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".jpg")
     }
 
-    static func saveLocalThumbnail(_ jpeg: Data, for fileID: String) throws {
-        let key = try VDriveCrypto.localKey()
-        let encrypted = try VDriveCrypto.seal(jpeg, key: key)
-        try saveEncryptedThumbnail(encrypted, for: fileID)
+    nonisolated static func saveLocalThumbnail(_ jpeg: Data, for fileID: String) throws {
+        let directory = thumbnailDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = directory
+        try? mutableURL.setResourceValues(values)
+        try jpeg.write(to: localThumbnailURL(for: fileID), options: [.atomic, .completeFileProtection])
     }
 
-    static func saveEncryptedThumbnail(_ encrypted: Data, for fileID: String) throws {
+    nonisolated static func saveEncryptedThumbnail(_ encrypted: Data, for fileID: String) throws {
         let directory = thumbnailDirectory()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var values = URLResourceValues()
@@ -242,12 +309,12 @@ private struct VaultThumbnail: View {
         try encrypted.write(to: localThumbnailURL(for: fileID), options: [.atomic, .completeFileProtection])
     }
 
-    static func removeLocalThumbnail(for fileID: String) {
+    nonisolated static func removeLocalThumbnail(for fileID: String) {
         try? FileManager.default.removeItem(at: localThumbnailURL(for: fileID))
         try? FileManager.default.removeItem(at: legacyLocalThumbnailURL(for: fileID))
     }
 
-    static func makeJPEGThumbnail(from data: Data, filename: String) -> Data? {
+    nonisolated static func makeJPEGThumbnail(from data: Data, filename: String) -> Data? {
         let ext = (filename as NSString).pathExtension.lowercased()
         let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv"]
         let mediaImage: UIImage?
@@ -268,46 +335,60 @@ private struct VaultThumbnail: View {
                 return nil
             }
         } else {
-            mediaImage = UIImage(data: data)
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            mediaImage = UIImage(cgImage: thumbnail)
         }
         guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
         return renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / mediaImage.size.width, 320 / mediaImage.size.height)
+            let scale = max(320 / mediaImage.size.width, 320 / mediaImage.size.height)
             let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
             mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
         }
     }
 
-    private func makeEncryptedThumbnailForCloudFile(_ encryptedFile: URL, key: SymmetricKey) throws -> Data? {
-        let sealed = try Data(contentsOf: encryptedFile)
-        let original = try VDriveCrypto.open(sealed, key: key)
-        let rawName = encryptedFile.deletingPathExtension().lastPathComponent
-        let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
-        let ext = (mediaName as NSString).pathExtension.lowercased()
+    nonisolated static func makeJPEGThumbnail(fromFileURL url: URL, filename: String) -> Data? {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv", "3gp"]
         let mediaImage: UIImage?
-        if ["mov", "mp4", "m4v", "avi", "mkv"].contains(ext) {
-            let temp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("vdrive-poster-" + UUID().uuidString + "." + ext)
-            try original.write(to: temp, options: [.atomic, .completeFileProtection])
-            defer { try? FileManager.default.removeItem(at: temp) }
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: temp))
+        if videoExtensions.contains(ext) {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
             generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 320, height: 320)
-            let frame = try generator.copyCGImage(at: CMTime(seconds: 0.2, preferredTimescale: 600), actualTime: nil)
-            mediaImage = UIImage(cgImage: frame)
+            generator.maximumSize = CGSize(width: 640, height: 640)
+            generator.requestedTimeToleranceBefore = CMTime(seconds: 1, preferredTimescale: 600)
+            generator.requestedTimeToleranceAfter = CMTime(seconds: 1, preferredTimescale: 600)
+            do {
+                let frame = try generator.copyCGImage(at: CMTime(seconds: 0.5, preferredTimescale: 600), actualTime: nil)
+                mediaImage = UIImage(cgImage: frame)
+            } catch { return nil }
         } else {
-            mediaImage = UIImage(data: original)
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            mediaImage = UIImage(cgImage: thumbnail)
         }
-        guard let mediaImage else { return nil }
+        guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
-        let jpeg = renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / mediaImage.size.width, 320 / mediaImage.size.height)
+        return renderer.jpegData(withCompressionQuality: 0.58) { _ in
+            let scale = max(320 / mediaImage.size.width, 320 / mediaImage.size.height)
             let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
             mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
         }
-        return try VDriveCrypto.seal(jpeg, key: key)
     }
+
+
 }
 
 struct VDriveHomeView: View {
@@ -330,6 +411,10 @@ struct VDriveHomeView: View {
     @State private var transferProgress = 0
     @State private var transferTotal = 0
     @State private var transferLabel = ""
+    @State private var transferBytes: Int64 = 0
+    @State private var transferExpectedBytes: Int64 = 0
+    @State private var transferSpeedBytesPerSecond: Double = 0
+    @State private var autoConnectAttempted = false
     @State private var locked = true
     @State private var showingAuthenticator = true
     @State private var localStorageBytes: Int64 = 0
@@ -360,6 +445,7 @@ struct VDriveHomeView: View {
     @State private var showCloudRecoveryPrompt = false
     @State private var showPINAlert = false
     @State private var isConnected = GoogleDriveStore.shared.hasRefreshToken
+    @State private var diagnosticLoggingEnabled = UserDefaults.standard.bool(forKey: "vdrive.diagnostics.enabled")
     @State private var cloudVaultUnlocked = false
     @State private var showGoogleSetupInfo = false
     @State private var fileProperties: FileProperties?
@@ -369,18 +455,22 @@ struct VDriveHomeView: View {
 
     var body: some View {
         mainContent
-            .task { refreshFiles() }
-        .onChange(of: scenePhase) { newPhase in
+            .task {
+                refreshFiles()
+                await migrateLegacyLocalFiles()
+                refreshFiles()
+            }
+        .onChange(of: scenePhase) { _, newPhase in
             handleScenePhaseChange(newPhase)
             if newPhase == .active { flipMotion.start() } else { flipMotion.stop() }
         }
-        .onChange(of: flipMotion.faceDown) { faceDown in
+        .onChange(of: flipMotion.faceDown) { _, faceDown in
             if faceDown { sawFaceDown = true }
             else if sawFaceDown { thumbnailsBlurred.toggle(); sawFaceDown = false }
         }
         .onAppear { flipMotion.start() }
         .onDisappear { flipMotion.stop() }
-        .onChange(of: selection) { items in Task { await importItems(items) } }
+        .onChange(of: selection) { _, items in Task { await importItems(items) } }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .sheet(isPresented: $showingFileImporter) {
             FileImportPicker { result in
@@ -390,7 +480,7 @@ struct VDriveHomeView: View {
                     guard !urls.isEmpty else { message = "Файлы не выбраны."; return }
                     Task { await importFilesFromPicker(urls) }
                 case .failure(let error):
-                    message = "Ошибка выбора файлов: \\(error.localizedDescription)"
+                    message = "Ошибка выбора файлов: \(error.localizedDescription)"
                 }
             }
             .ignoresSafeArea()
@@ -399,7 +489,7 @@ struct VDriveHomeView: View {
             Button("Удалить оригиналы", role: .destructive) { deleteImportedPhotoOriginals() }
             Button("Оставить в Фото", role: .cancel) { finishLocalImportAndSync() }
         } message: {
-            Text("Копии уже зашифрованы и сохранены внутри VDrive. Можно удалить исходные фото и видео из медиатеки Apple Фото. Они попадут в «Недавно удалённые» и не удалятся окончательно сразу.")
+            Text("Копии сохранены в VDrive на устройстве. При синхронизации в Google Drive они шифруются. Можно удалить исходные фото и видео из медиатеки Apple Фото; они попадут в «Недавно удалённые».")
         }
         .alert("Секретный ключ Authenticator", isPresented: $showAuthenticatorSecretEntry) {
             TextField("Base32 secret key", text: $authenticatorSecretDraft)
@@ -471,9 +561,12 @@ struct VDriveHomeView: View {
                     message = "Хранилище готово. Выгружай файлы вручную, когда закончишь добавлять их локально."
                 }
             }
-            Button("Закрыть без выгрузки", role: .cancel) {}
+            Button("Закрыть", role: .cancel) {
+                cloudVaultUnlocked = true
+                Task { await refreshCloudInventory(); refreshFiles() }
+            }
         } message: {
-            Text("Сохрани этот секретный ключ отдельно от телефона. Он понадобится после переустановки приложения. Google уже хранит зашифрованную запись для восстановления. Ключ: \(recoveryCode)")
+            Text("Это дополнительный старый код восстановления. Основной ключ шифрования можно скопировать в настройках; Google хранит его копию для автоматического восстановления.")
         }
         .alert("Восстановление VDrive", isPresented: $showCloudRecoveryPrompt) {
             SecureField("Секретный ключ", text: $recoveryCodeInput)
@@ -599,7 +692,7 @@ struct VDriveHomeView: View {
                 Image(systemName: "doc.on.doc").font(.system(size: 15, weight: .semibold))
                     .frame(width: 38, height: 38).glassEffect(.regular.interactive(), in: Circle())
             }
-            .buttonStyle(.plain).accessibilityLabel("Скопировать демонстрационный код \\(service)")
+            .buttonStyle(.plain).accessibilityLabel("Скопировать демонстрационный код \(service)")
         }
         .foregroundStyle(.primary)
         .padding(14)
@@ -663,9 +756,9 @@ struct VDriveHomeView: View {
                     if pinSetupMode {
                         guard pinEntry.count >= 4 else { message = "PIN должен содержать минимум 4 цифры"; return }
                         UserDefaults.standard.set(pinDigest(pinEntry), forKey: pinKey)
-                        pinEntry = ""; pinSetupMode = false; locked = false; showingAuthenticator = false
+                        pinEntry = ""; pinSetupMode = false; locked = false; showingAuthenticator = false; Task { await autoConnectGoogleIfNeeded() }
                     } else if let saved = UserDefaults.standard.string(forKey: pinKey) {
-                        if saved == pinDigest(pinEntry) { pinEntry = ""; locked = false; showingAuthenticator = false; Task { await refreshCloudInventory() } }
+                        if saved == pinDigest(pinEntry) { pinEntry = ""; locked = false; showingAuthenticator = false; Task { await autoConnectGoogleIfNeeded(); await refreshCloudInventory() } }
                         else { message = "Неверный PIN-код" }
                     } else {
                         pinSetupMode = true
@@ -710,7 +803,7 @@ struct VDriveHomeView: View {
                 Spacer()
                 HStack(spacing: 7) {
                     Image(systemName: "checkmark.shield.fill")
-                    Text("Ваши данные остаются зашифрованными")
+                    Text("Облачные копии шифруются; локальные файлы защищены iOS")
                 }
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.white.opacity(0.42))
@@ -743,18 +836,26 @@ struct VDriveHomeView: View {
                                         .font(.footnote.weight(.medium))
                                         .lineLimit(2)
                                     Spacer(minLength: 4)
-                                    if transferTotal > 0 {
+                                    if transferExpectedBytes > 0 {
+                                        Text("\(ByteCountFormatter.string(fromByteCount: transferBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: transferExpectedBytes, countStyle: .file))")
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    } else if transferTotal > 0 {
                                         Text("\(transferProgress)/\(transferTotal)")
                                             .font(.caption.monospacedDigit())
                                             .foregroundStyle(.secondary)
                                     }
                                 }
-                                if transferTotal > 0 {
-                                    ProgressView(value: Double(min(transferProgress, transferTotal)), total: Double(transferTotal))
-                                        .tint(.primary)
-                                } else {
-                                    ProgressView()
-                                }
+                                if transferExpectedBytes > 0 {
+                                    ProgressView(value: Double(min(transferBytes, transferExpectedBytes)), total: Double(transferExpectedBytes)).tint(.primary)
+                                    HStack {
+                                        Text("\(Int(Double(transferBytes) / Double(max(transferExpectedBytes, 1)) * 100))%")
+                                        Spacer()
+                                        Text("\(ByteCountFormatter.string(fromByteCount: Int64(transferSpeedBytesPerSecond), countStyle: .file))/с")
+                                    }.font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                                } else if transferTotal > 0 {
+                                    ProgressView(value: Double(min(transferProgress, transferTotal)), total: Double(transferTotal)).tint(.primary)
+                                } else { ProgressView() }
                             }
                             .padding(12)
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -767,7 +868,7 @@ struct VDriveHomeView: View {
                             ContentUnavailableView(
                                 "Хранилище пусто",
                                 systemImage: "lock.doc",
-                                description: Text("Добавьте фото или видео — они будут зашифрованы на устройстве.")
+                                description: Text("Добавьте фото или видео. На iPhone они хранятся открытыми для быстрого просмотра, в Google Drive — зашифрованными.")
                             )
                             .padding(.top, 24)
                         } else {
@@ -1022,8 +1123,8 @@ struct VDriveHomeView: View {
         defer { busy = false; refreshFiles() }
         do {
             for file in targets {
-                try await GoogleDriveStore.shared.upload(file.url)
-                if let thumb = try makeEncryptedThumbnail(for: file.url) {
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
+                if let thumb = try self.makeEncryptedThumbnail(for: file.url) {
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
                 }
             }
@@ -1040,7 +1141,7 @@ struct VDriveHomeView: View {
         do {
             for file in targets {
                 guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { continue }
-                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL())
+                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey())
             }
             await refreshCloudInventory()
             message = "Выбранные файлы скачаны."
@@ -1117,14 +1218,28 @@ struct VDriveHomeView: View {
         .frame(maxWidth: .infinity, minHeight: 46)
     }
 
+    private var displayedVaultKey: String {
+        VDriveCrypto.existingLocalKeyData()?.base64EncodedString() ?? "Подключи Google Drive, чтобы создать ключ"
+    }
+
     private var settingsSheet: some View {
         NavigationStack {
             Form {
                 Section("Занятая память") {
                     HStack { Label("На телефоне", systemImage: "iphone"); Spacer(); Text(ByteCountFormatter.string(fromByteCount: localStorageBytes, countStyle: .file)).fontWeight(.semibold).monospacedDigit() }
                     HStack { Label("Google Drive", systemImage: "cloud"); Spacer(); Text(ByteCountFormatter.string(fromByteCount: cloudStorageBytes, countStyle: .file)).fontWeight(.semibold).monospacedDigit() }
-                    Text("Размер зашифрованных файлов библиотеки. Обновляется при синхронизации и изменениях списка файлов.").font(.footnote).foregroundStyle(.secondary)
+                    Text("На телефоне оригиналы и миниатюры хранятся открытыми для быстрого просмотра; в Google Drive они шифруются.").font(.footnote).foregroundStyle(.secondary)
                     Button("Обновить статистику") { refreshFiles(); Task { await refreshCloudInventory() } }
+                }
+                Section("Журнал диагностики") {
+                    Toggle("Вести подробный журнал", isOn: $diagnosticLoggingEnabled)
+                        .onChange(of: diagnosticLoggingEnabled) { _, enabled in VDriveDiagnosticLog.shared.setEnabled(enabled) }
+                    Button("Выгрузить журнал", systemImage: "square.and.arrow.up") {
+                        do { let url = try VDriveDiagnosticLog.shared.export(); shareURL = url; exportToFiles = false; showingShareSheet = true }
+                        catch { message = "Не удалось подготовить журнал: \(error.localizedDescription)" }
+                    }
+                    Text("Записываются этапы операций, время, размеры файлов, сетевые статусы и ошибки. Пароли, токены, ключ шифрования и содержимое файлов не записываются.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Google Drive") {
                     LabeledContent("Статус", value: isConnected ? "Подключён" : "Не подключён")
@@ -1143,10 +1258,23 @@ struct VDriveHomeView: View {
                     Text("В Google Drive хранятся зашифрованные .vdrive-файлы, а не открытые фото.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                Section("Секретный ключ") {
-                    Text("При первом подключении Google VDrive создаёт секретный ключ. Сохрани его отдельно: после переустановки он понадобится для доступа к облачным файлам.")
+                Section("Ключ шифрования") {
+                    Text(displayedVaultKey)
+                        .font(.system(.footnote, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Скопировать ключ", systemImage: "doc.on.doc") {
+                        UIPasteboard.general.string = displayedVaultKey
+                        message = "Ключ скопирован. Храни его в безопасном месте."
+                    }
+                    .disabled(VDriveCrypto.existingLocalKeyData() == nil)
+                    Text("Ключ хранится в Keychain этого iPhone. Для автоматического восстановления после переустановки он также сохраняется в закрытой папке данных твоего Google Drive. Доступ к Google-аккаунту означает доступ к этой копии ключа.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    Button("Ввести секретный ключ VDrive", systemImage: "key.fill") {
+                }
+                Section("Восстановление") {
+                    Text("При обычном входе в тот же Google-аккаунт VDrive пытается восстановить ключ автоматически. Старый код восстановления оставлен для совместимости.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Восстановить по старому коду", systemImage: "key.fill") {
                         showSettings = false
                         Task {
                             guard isConnected else {
@@ -1210,21 +1338,19 @@ struct VDriveHomeView: View {
         var added = 0
         var assetIDs: [String] = []
         var failures: [String] = []
-        do {
-            let key = try VDriveCrypto.localKey()
-            for (index, item) in items.enumerated() {
+        for (index, item) in items.enumerated() {
                 transferProgress = index
                 transferLabel = "Читаю фото или видео: \(index + 1) из \(items.count)"
                 message = transferLabel
                 do {
-                    guard let raw = try await item.loadTransferable(type: Data.self) else {
-                        failures.append("Элемент \(index + 1): iOS не передала данные")
+                    guard let transferred = try await item.loadTransferable(type: PickerFileTransfer.self) else {
+                        failures.append("Элемент \(index + 1): iOS не передала файл")
                         continue
                     }
-                    transferLabel = "Шифрую и сохраняю: \(index + 1) из \(items.count)"
+                    defer { try? FileManager.default.removeItem(at: transferred.url) }
+                    transferLabel = "Сохраняю на iPhone: \(index + 1) из \(items.count)"
                     message = transferLabel
-                    let sealed = try VDriveCrypto.seal(raw, key: key)
-                    let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "bin"
+                    let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? transferred.url.pathExtension
                     let addedTimestamp = Date().timeIntervalSince1970
                     let captureDate: Date? = item.itemIdentifier.flatMap { identifier in
                         PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject?.creationDate
@@ -1233,9 +1359,13 @@ struct VDriveHomeView: View {
                     let name = UUID().uuidString + "__A" + String(Int(addedTimestamp)) +
                         "__C" + String(Int(captureTimestamp)) + "__media." + ext + ".vdrive"
                     let url = documentsURL().appendingPathComponent(name)
-                    try sealed.write(to: url, options: [.atomic, .completeFileProtection])
+                    try await Task.detached(priority: .utility) {
+                        try FileManager.default.copyItem(at: transferred.url, to: url)
+                        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+                    }.value
+                    VDriveCrypto.markLocalPlaintextFile(url)
                     if let jpeg = await Task.detached(priority: .utility, operation: {
-                        VaultThumbnail.makeJPEGThumbnail(from: raw, filename: "media." + ext)
+                        VaultThumbnail.makeJPEGThumbnail(fromFileURL: url, filename: "media." + ext)
                     }).value {
                         try? await Task.detached(priority: .utility) {
                             try VaultThumbnail.saveLocalThumbnail(jpeg, for: name)
@@ -1257,7 +1387,7 @@ struct VDriveHomeView: View {
                 return
             }
 
-            message = "Зашифровано и сохранено на iPhone: \(added)." +
+            message = "Сохранено на iPhone: \(added)." +
                 (failures.isEmpty ? "" : " Не удалось импортировать: \(failures.count).")
             pendingPhotoAssetIDs = assetIDs
             pendingCloudSync = isConnected
@@ -1266,9 +1396,6 @@ struct VDriveHomeView: View {
             } else {
                 finishLocalImportAndSync()
             }
-        } catch {
-            message = "Не удалось начать импорт: \(error.localizedDescription)"
-        }
     }
 
     @MainActor private func finishLocalImportAndSync() {
@@ -1297,7 +1424,7 @@ struct VDriveHomeView: View {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
             guard status == .authorized || status == .limited else {
                 Task { @MainActor in
-                    message = "VDrive сохранил зашифрованные копии, но iOS не разрешила удалить оригиналы из Фото."
+                    message = "VDrive сохранил копии на устройстве, но iOS не разрешила удалить оригиналы из Фото."
                     finishLocalImportAndSync()
                 }
                 return
@@ -1315,7 +1442,7 @@ struct VDriveHomeView: View {
             }) { success, error in
                 Task { @MainActor in
                     if success {
-                        message = "Копии зашифрованы в VDrive. Исходники перемещены в «Недавно удалённые»."
+                        message = "Копии сохранены в VDrive. Исходники перемещены в «Недавно удалённые»."
                     } else {
                         message = "Копии сохранены в VDrive, но оригиналы не удалены: \(error?.localizedDescription ?? "неизвестная ошибка")"
                     }
@@ -1330,19 +1457,9 @@ struct VDriveHomeView: View {
         busy = true
         message = "Импортирую выбранные файлы…"
         defer { busy = false }
-        do {
-            let key = try VDriveCrypto.localKey()
-            var added = 0
-            var skipped: [String] = []
+        var added = 0
+        var skipped: [String] = []
             for sourceURL in urls {
-                let raw: Data
-                do {
-                    raw = try readImportedFile(from: sourceURL)
-                } catch {
-                    skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
-                    continue
-                }
-
                 let originalName = sourceURL.lastPathComponent.replacingOccurrences(of: "/", with: "_")
                 let safeName = originalName.isEmpty ? "file.bin" : originalName
                 let addedTimestamp = Date().timeIntervalSince1970
@@ -1351,10 +1468,17 @@ struct VDriveHomeView: View {
                 let name = UUID().uuidString + "__A" + String(format: "%.3f", addedTimestamp) +
                     "__C" + String(format: "%.3f", captureTimestamp) + "__" + safeName + ".vdrive"
                 let destination = documentsURL().appendingPathComponent(name)
-                let sealed = try VDriveCrypto.seal(raw, key: key)
-                try sealed.write(to: destination, options: [.atomic, .completeFileProtection])
+                do {
+                    try await Task.detached(priority: .utility) {
+                        try self.copyImportedFile(from: sourceURL, to: destination)
+                    }.value
+                    VDriveCrypto.markLocalPlaintextFile(destination)
+                } catch {
+                    skipped.append(sourceURL.lastPathComponent + " (" + error.localizedDescription + ")")
+                    continue
+                }
                 if let jpeg = await Task.detached(priority: .utility, operation: {
-                    VaultThumbnail.makeJPEGThumbnail(from: raw, filename: safeName)
+                    VaultThumbnail.makeJPEGThumbnail(fromFileURL: destination, filename: safeName)
                 }).value {
                     try? await Task.detached(priority: .utility) {
                         try VaultThumbnail.saveLocalThumbnail(jpeg, for: name)
@@ -1367,7 +1491,7 @@ struct VDriveHomeView: View {
             if added == 0 {
                 message = skipped.isEmpty ? "Файлы не были добавлены." : "Не добавлено: " + skipped.joined(separator: ", ")
             } else {
-                message = "Добавлено и зашифровано: \(added)" + (skipped.isEmpty ? "" : ". Пропущено: " + skipped.joined(separator: ", "))
+                message = "Добавлено на устройство: \(added)" + (skipped.isEmpty ? "" : ". Пропущено: " + skipped.joined(separator: ", "))
             }
             if added > 0 && isConnected {
                 pendingCloudSync = true
@@ -1376,125 +1500,132 @@ struct VDriveHomeView: View {
                     finishLocalImportAndSync()
                 }
             }
-        } catch {
-            message = "Импорт не удался: \(error.localizedDescription)"
-        }
     }
 
-    private func readImportedFile(from sourceURL: URL) throws -> Data {
+    nonisolated private func copyImportedFile(from sourceURL: URL, to destination: URL) throws {
         let hasAccess = sourceURL.startAccessingSecurityScopedResource()
-        defer {
-            if hasAccess { sourceURL.stopAccessingSecurityScopedResource() }
-        }
-
+        defer { if hasAccess { sourceURL.stopAccessingSecurityScopedResource() } }
         var coordinationError: NSError?
-        var readError: Error?
-        var rawData: Data?
+        var copyError: Error?
         let coordinator = NSFileCoordinator(filePresenter: nil)
         coordinator.coordinate(readingItemAt: sourceURL, options: [], error: &coordinationError) { readableURL in
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: readableURL.path, isDirectory: &isDirectory) else {
-                readError = CocoaError(.fileReadNoSuchFile)
-                return
-            }
-            guard !isDirectory.boolValue else {
-                readError = CocoaError(.fileReadUnsupportedScheme)
-                return
-            }
             do {
-                rawData = try Data(contentsOf: readableURL, options: [.mappedIfSafe])
-            } catch {
-                readError = error
-            }
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: readableURL.path, isDirectory: &isDirectory) else {
+                    throw CocoaError(.fileReadNoSuchFile)
+                }
+                guard !isDirectory.boolValue else { throw CocoaError(.fileReadUnsupportedScheme) }
+                try FileManager.default.copyItem(at: readableURL, to: destination)
+                try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete],
+                                                      ofItemAtPath: destination.path)
+            } catch { copyError = error }
         }
         if let coordinationError { throw coordinationError }
-        if let readError { throw readError }
-        guard let rawData else { throw CocoaError(.fileReadUnknown) }
-        return rawData
+        if let copyError { throw copyError }
     }
 
-    private func makeEncryptedThumbnail(for encryptedFile: URL) throws -> Data? {
-        let key = try VDriveCrypto.localKey()
-        let sealed = try Data(contentsOf: encryptedFile)
-        let original = try VDriveCrypto.open(sealed, key: key)
-        let rawName = encryptedFile.deletingPathExtension().lastPathComponent
+    nonisolated private func makeEncryptedThumbnail(for localFile: URL) throws -> Data? {
+        let rawName = localFile.deletingPathExtension().lastPathComponent
         let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
-        let ext = (mediaName as NSString).pathExtension.lowercased()
-        let image: UIImage?
-        if ["mov", "mp4", "m4v", "avi", "mkv"].contains(ext) {
-            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("vdrive-poster-" + UUID().uuidString + "." + ext)
-            try original.write(to: temp, options: [.atomic, .completeFileProtection])
-            defer { try? FileManager.default.removeItem(at: temp) }
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: temp))
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 320, height: 320)
-            let frame = try generator.copyCGImage(at: CMTime(seconds: 0.2, preferredTimescale: 600), actualTime: nil)
-            image = UIImage(cgImage: frame)
-        } else {
-            image = UIImage(data: original)
-        }
-        guard let image else { return nil }
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
-        let jpeg = renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / image.size.width, 320 / image.size.height)
-            let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            image.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
-        }
-        return try VDriveCrypto.seal(jpeg, key: key)
+        guard let jpeg = VaultThumbnail.makeJPEGThumbnail(fromFileURL: localFile, filename: mediaName) else { return nil }
+        return try VDriveCrypto.seal(jpeg, key: VDriveCrypto.localKey())
+    }
+
+    private func metadataCaptureDate(at url: URL, filename: String) async -> Date? {
+        await Task.detached(priority: .utility) {
+            let ext = (filename as NSString).pathExtension.lowercased()
+            let imageTypes = ["jpg", "jpeg", "heic", "heif", "tif", "tiff", "png", "webp"]
+            if imageTypes.contains(ext),
+               let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
+                let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any]
+                let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+                let raw = (exif?[kCGImagePropertyExifDateTimeOriginal] as? String)
+                    ?? (exif?[kCGImagePropertyExifDateTimeDigitized] as? String)
+                    ?? (tiff?[kCGImagePropertyTIFFDateTime] as? String)
+                if let raw {
+                    let formatter = DateFormatter()
+                    formatter.locale = Locale(identifier: "en_US_POSIX")
+                    formatter.timeZone = .current
+                    formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                    if let date = formatter.date(from: raw) { return date }
+                }
+            }
+
+            let videoTypes = ["mov", "mp4", "m4v", "3gp", "avi", "mkv"]
+            if videoTypes.contains(ext) {
+                let asset = AVURLAsset(url: url)
+                if let metadata = try? await asset.load(.commonMetadata),
+                   let item = metadata.first(where: { $0.commonKey == .commonKeyCreationDate }) {
+                    if let date = item.dateValue { return date }
+                    if let value = item.stringValue {
+                        let iso = ISO8601DateFormatter()
+                        if let date = iso.date(from: value) { return date }
+                        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                        if let date = iso.date(from: value) { return date }
+                    }
+                }
+            }
+            return nil
+        }.value
     }
 
     @MainActor private func showFileProperties(_ file: VaultFile) async {
         guard file.isLocal else {
             let ext = (file.displayName as NSString).pathExtension
             let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
-            let added = file.addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: file.addedDate, dateStyle: .medium, timeStyle: .short)
+            let added = file.addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: file.addedDate, dateStyle: .medium, timeStyle: .medium)
+            let captured = file.captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "Будет прочитана из метаданных после скачивания"
             fileProperties = FileProperties(
                 title: file.displayName,
-                details: "Имя: \(file.displayName)\nТип: \(type)\nРасположение: Google Drive\nДата добавления: \(added)\nРазмер и длительность: доступны после скачивания файла на устройство."
+                details: "Имя: \(file.displayName)\nТип: \(type)\nРасположение: Google Drive\nДата добавления: \(added)\nДата съёмки / создания: \(captured)\nРазмер и длительность: доступны после скачивания файла на устройство."
             )
             return
         }
 
+        let fileURL = file.url
+        let displayName = file.displayName
+        let addedDate = file.addedDate
+        let captureDate = await metadataCaptureDate(at: fileURL, filename: displayName) ?? file.captureDate
         do {
             let details = try await Task.detached(priority: .utility) { () throws -> String in
-                let encrypted = try Data(contentsOf: file.url, options: [.mappedIfSafe])
-                let key = try VDriveCrypto.localKey()
-                let plain = try VDriveCrypto.open(encrypted, key: key)
-                let ext = (file.displayName as NSString).pathExtension.lowercased()
-                let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
+                let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
+                let bytes = Int64(values.fileSize ?? 0)
                 let formatter = ByteCountFormatter()
                 formatter.countStyle = .file
-                let size = formatter.string(fromByteCount: Int64(plain.count))
-                let added = file.addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: file.addedDate, dateStyle: .medium, timeStyle: .short)
-                let captured = file.captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .short) } ?? "Не сохранена"
+                let ext = (displayName as NSString).pathExtension.lowercased()
+                let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
+                let added = addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: addedDate, dateStyle: .medium, timeStyle: .short)
+                let captured = captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "Не сохранена"
                 var lines = [
-                    "Имя: \(file.displayName)",
+                    "Имя: \(displayName)",
                     "Тип: \(type)",
-                    "Размер файла: \(size) (\(plain.count) байт)",
+                    "Размер файла: \(formatter.string(fromByteCount: bytes)) (\(bytes) байт)",
                     "Дата добавления: \(added)",
-                    "Дата съёмки / создания: \(captured)",
-                    "Расположение: iPhone"
+                    "Дата съёмки / создания: \(captured)"
                 ]
                 if ["mov", "mp4", "m4v", "avi", "mkv", "3gp"].contains(ext) {
-                    let temp = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("vdrive-properties-\(UUID().uuidString).\(ext)")
-                    defer { try? FileManager.default.removeItem(at: temp) }
-                    try plain.write(to: temp, options: [.atomic, .completeFileProtection])
-                    let asset = AVURLAsset(url: temp)
-                    let seconds = asset.duration.seconds
-                    if seconds.isFinite && seconds >= 0 {
-                        let total = Int(seconds.rounded())
-                        lines.append(String(format: "Длительность видео: %d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60))
-                    } else {
-                        lines.append("Длительность видео: не удалось определить")
+                    let asset = AVURLAsset(url: fileURL)
+                    if let duration = try? await asset.load(.duration) {
+                        let seconds = duration.seconds
+                        if seconds.isFinite && seconds >= 0 {
+                            let total = Int(seconds.rounded())
+                            lines.append(String(format: "Длительность видео: %d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60))
+                        }
                     }
-                    if let track = asset.tracks(withMediaType: .video).first {
-                        let size = track.naturalSize.applying(track.preferredTransform)
+                    if let tracks = try? await asset.loadTracks(withMediaType: .video),
+                       let track = tracks.first,
+                       let naturalSize = try? await track.load(.naturalSize),
+                       let preferredTransform = try? await track.load(.preferredTransform) {
+                        let size = naturalSize.applying(preferredTransform)
                         lines.append("Разрешение: \(Int(abs(size.width))) × \(Int(abs(size.height)))")
                     }
                 } else if ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tiff", "bmp"].contains(ext),
-                          let image = UIImage(data: plain) {
-                    lines.append("Разрешение: \(Int(image.size.width * image.scale)) × \(Int(image.size.height * image.scale))")
+                          let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
+                          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                          let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+                          let height = properties[kCGImagePropertyPixelHeight] as? NSNumber {
+                    lines.append("Разрешение: \(width.intValue) × \(height.intValue)")
                 }
                 return lines.joined(separator: "\n")
             }.value
@@ -1506,6 +1637,84 @@ struct VDriveHomeView: View {
 
     private func documentsURL() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    private func isClearlyPlaintextFile(_ url: URL, filename: String? = nil) -> Bool {
+        if VDriveCrypto.isMarkedLocalPlaintextFile(url) { return true }
+        let name = filename ?? VaultFile(id: url.lastPathComponent, url: url).displayName
+        let ext = (name as NSString).pathExtension.lowercased()
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let bytes = (try? handle.read(upToCount: 16)) ?? Data()
+        if ["jpg", "jpeg"].contains(ext) { return bytes.starts(with: [0xFF, 0xD8, 0xFF]) }
+        if ext == "png" { return bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) }
+        if ext == "gif" { return bytes.starts(with: Data("GIF8".utf8)) }
+        if ["mp4", "mov", "m4v", "3gp", "heic", "heif"].contains(ext) {
+            if bytes.count >= 8, String(data: bytes[4..<8], encoding: .ascii) == "ftyp" {
+                return true
+            }
+            if ["heic", "heif"].contains(ext), bytes.count >= 12 {
+                let brand = String(data: bytes[8..<12], encoding: .ascii) ?? ""
+                return ["heic", "heix", "hevc", "mif1", "msf1"].contains(brand)
+            }
+        }
+        if ext == "avi" { return bytes.starts(with: Data("RIFF".utf8)) }
+        if ext == "mkv" { return bytes.starts(with: [0x1A, 0x45, 0xDF, 0xA3]) }
+        if ["tif", "tiff"].contains(ext) {
+            return bytes.starts(with: [0x49, 0x49, 0x2A, 0x00]) || bytes.starts(with: [0x4D, 0x4D, 0x00, 0x2A])
+        }
+        if ext == "pdf" { return bytes.starts(with: Data("%PDF".utf8)) }
+        if ["zip", "docx", "xlsx", "pptx", "odt", "ods", "odp"].contains(ext) {
+            return bytes.starts(with: [0x50, 0x4B, 0x03, 0x04])
+        }
+        if ["txt", "csv", "json", "xml", "md", "rtf"].contains(ext),
+           let text = String(data: bytes, encoding: .utf8) {
+            return !text.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) && $0 != "\n" && $0 != "\r" && $0 != "\t" }
+        }
+        return false
+    }
+
+    @MainActor private func migrateLegacyLocalFiles() async {
+        guard let keyData = VDriveCrypto.existingLocalKeyData() else { return }
+        let key = SymmetricKey(data: keyData)
+        let urls = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+            .filter { $0.pathExtension == "vdrive" }
+        var migrated = 0
+        var skippedLarge = 0
+        for url in urls {
+            if isClearlyPlaintextFile(url) {
+                VDriveCrypto.markLocalPlaintextFile(url)
+                continue
+            }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            // Legacy whole-file AES-GCM needs the complete ciphertext and plaintext
+            // in memory. Avoid risking an iPhone memory-pressure kill on huge videos.
+            if size > 256 * 1024 * 1024 {
+                skippedLarge += 1
+                continue
+            }
+            let staging = documentsURL().appendingPathComponent("." + UUID().uuidString + ".migration")
+            do {
+                try await Task.detached(priority: .utility) {
+                    try VDriveCrypto.decryptFile(at: url, to: staging, key: key)
+                }.value
+                if FileManager.default.fileExists(atPath: staging.path) {
+                    _ = try FileManager.default.replaceItemAt(url, withItemAt: staging)
+                    VDriveCrypto.markLocalPlaintextFile(url)
+                    migrated += 1
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: staging)
+                // Plain files with uncommon extensions fail legacy authentication and
+                // are deliberately left untouched.
+            }
+        }
+        if migrated > 0 {
+            message = "Переведено в локальный открытый формат: \(migrated) файлов."
+        }
+        if skippedLarge > 0 {
+            message = "\(skippedLarge) старых крупных файлов пока оставлены в прежнем зашифрованном формате, чтобы не перегружать память. Остальные файлы доступны."
+        }
     }
 
     private func refreshFiles() {
@@ -1535,16 +1744,34 @@ struct VDriveHomeView: View {
         }
     }
 
+    private func previewCompatibleURL(for file: VaultFile) throws -> URL {
+        let safeName = URL(fileURLWithPath: file.displayName).lastPathComponent
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-preview-\(UUID().uuidString)-\(safeName)")
+        do {
+            try FileManager.default.linkItem(at: file.url, to: temp)
+        } catch {
+            try FileManager.default.copyItem(at: file.url, to: temp)
+        }
+        return temp
+    }
+
     private func decryptedTemporaryURL(for file: VaultFile) throws -> URL {
-        let encrypted = try Data(contentsOf: file.url)
-        let plain = try VDriveCrypto.open(encrypted, key: VDriveCrypto.localKey())
-        let rawName = file.url.deletingPathExtension().lastPathComponent
-        let pieces = rawName.components(separatedBy: "__")
-        let originalName = pieces.count > 1 ? pieces.dropFirst().joined(separator: "__") : rawName
-        let ext = originalName.split(separator: ".").last.map(String.init) ?? "bin"
-        let safeName = originalName.isEmpty ? "VDrive-file.\(ext)" : originalName
+        let safeName = URL(fileURLWithPath: file.displayName).lastPathComponent
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-\(UUID().uuidString)-\(safeName)")
-        try plain.write(to: temp, options: [.atomic, .completeFileProtection])
+        let size = (try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        if isClearlyPlaintextFile(file.url) || size > 256 * 1024 * 1024 {
+            try FileManager.default.copyItem(at: file.url, to: temp)
+            return temp
+        }
+        guard let keyData = VDriveCrypto.existingLocalKeyData() else {
+            throw NSError(domain: "VDrive", code: -1, userInfo: [NSLocalizedDescriptionKey: "На устройстве нет ключа для расшифровки этого файла."])
+        }
+        do {
+            try VDriveCrypto.decryptFile(at: file.url, to: temp, key: SymmetricKey(data: keyData))
+        } catch {
+            try? FileManager.default.removeItem(at: temp)
+            throw error
+        }
         return temp
     }
 
@@ -1553,7 +1780,17 @@ struct VDriveHomeView: View {
         guard file.isLocal else { Task { await downloadAndOpen(file) }; return }
         do {
             let currentFiles = sortedFiles.filter { $0.isLocal }
-            let urls = try currentFiles.map { try decryptedTemporaryURL(for: $0) }
+            var temporaryURLs: [URL] = []
+            let urls = try currentFiles.map { current -> URL in
+                if isClearlyPlaintextFile(current.url) {
+                    let temp = try previewCompatibleURL(for: current)
+                    temporaryURLs.append(temp)
+                    return temp
+                }
+                let temp = try decryptedTemporaryURL(for: current)
+                temporaryURLs.append(temp)
+                return temp
+            }
             let items = zip(currentFiles, urls).enumerated().map { index, pair in
                 PreviewItem(id: index, name: pair.0.displayName, url: pair.1)
             }
@@ -1561,7 +1798,7 @@ struct VDriveHomeView: View {
                 message = "Хранилище ещё загружается. Попробуйте снова."
                 return
             }
-            previewURLs = urls
+            previewURLs = temporaryURLs
             previewIndex = currentFiles.firstIndex(of: file) ?? 0
             previewPresentation = PreviewPresentation(items: items, initialIndex: previewIndex)
         } catch {
@@ -1642,18 +1879,31 @@ struct VDriveHomeView: View {
         busy = true
         transferProgress = 0
         transferTotal = 2
-        transferLabel = "Выгрузка файла в Google Drive"
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
+        transferLabel = "Шифрую и выгружаю в Google Drive…"
         defer {
             busy = false
             transferLabel = ""
             transferProgress = 0
             transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
         }
         do {
-            try await GoogleDriveStore.shared.upload(file.url)
+            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+                self.transferBytes = sent
+                self.transferExpectedBytes = total
+                self.transferSpeedBytesPerSecond = speed
+            }
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
-            if let thumb = try makeEncryptedThumbnail(for: file.url) {
+            let thumb = try await Task.detached(priority: .utility) {
+                try self.makeEncryptedThumbnail(for: file.url)
+            }.value
+            if let thumb {
                 try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb")
             }
             transferProgress = 2
@@ -1663,24 +1913,38 @@ struct VDriveHomeView: View {
     }
 
     @MainActor private func downloadFile(_ file: VaultFile) async {
+        guard !busy else { message = "Дождись завершения текущей операции."; return }
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         guard !file.isLocal, let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return }
         busy = true
         transferProgress = 0
         transferTotal = 1
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
         transferLabel = "Скачиваю файл с Google Drive…"
         defer {
             busy = false
             transferLabel = ""
             transferProgress = 0
             transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
         }
         do {
-            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL())
+            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey()) { received, total, speed in
+                self.transferBytes = received
+                self.transferExpectedBytes = total
+                self.transferSpeedBytesPerSecond = speed
+            }
             transferProgress = 1
             refreshFiles()
             message = "Файл скачан на устройство."
-        } catch { message = "Не удалось скачать файл: \(error.localizedDescription)" }
+        } catch {
+            VDriveDiagnosticLog.shared.write("ERROR", "Скачивание \(file.id): \(error.localizedDescription)")
+            message = "Не удалось скачать файл: \(error.localizedDescription)"
+        }
     }
 
     @MainActor private func downloadAndOpen(_ file: VaultFile) async {
@@ -1694,6 +1958,7 @@ struct VDriveHomeView: View {
         do {
             guard file.isLocal else { message = "Файл хранится только в Google Drive."; return }
             try FileManager.default.removeItem(at: file.url)
+            VDriveCrypto.unmarkLocalPlaintextFile(file.url)
             VaultThumbnail.removeLocalThumbnail(for: file.id)
             refreshFiles()
             message = file.uploaded ? "Удалено с устройства. Копия в Google Drive сохранена." : "Файл удалён с устройства."
@@ -1713,7 +1978,10 @@ struct VDriveHomeView: View {
         if file.uploaded && !cloudVaultUnlocked { message = "Нельзя менять облако до ввода кода восстановления."; return }
         do {
             if file.uploaded { try await GoogleDriveStore.shared.delete(id: file.id) }
-            if file.isLocal { try? FileManager.default.removeItem(at: file.url) }
+            if file.isLocal {
+                try? FileManager.default.removeItem(at: file.url)
+                VDriveCrypto.unmarkLocalPlaintextFile(file.url)
+            }
             VaultThumbnail.removeLocalThumbnail(for: file.id)
             refreshFiles()
             message = "Файл удалён с устройства и из Google Drive."
@@ -1737,10 +2005,10 @@ struct VDriveHomeView: View {
         do {
             for (index, file) in pending.enumerated() {
                 transferLabel = "Выгружаю медиа: \(index + 1) из \(pending.count)"
-                try await GoogleDriveStore.shared.upload(file.url)
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
                 transferLabel = "Выгружено \(index + 1) из \(pending.count). Создаю миниатюру в фоне…"
                 let thumb = try await Task.detached(priority: .utility) {
-                    try makeEncryptedThumbnail(for: file.url)
+                    try self.makeEncryptedThumbnail(for: file.url)
                 }.value
                 if let thumb {
                     transferLabel = "Передаю миниатюру: \(index + 1) из \(pending.count)"
@@ -1754,6 +2022,8 @@ struct VDriveHomeView: View {
     }
 
     @MainActor private func downloadMissing() async {
+        guard !busy else { message = "Дождись завершения текущей операции."; return }
+        VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
         busy = true
@@ -1768,26 +2038,38 @@ struct VDriveHomeView: View {
         }
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames)
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())
+            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
             transferProgress = count
             transferTotal = max(count, 1)
             transferLabel = "Загрузка из Google Drive завершена"
             refreshFiles()
             message = count == 0 ? "Все облачные файлы уже на устройстве." : "Скачано с Google Drive: \(count)"
-        } catch { message = "Ошибка скачивания: \(error.localizedDescription)" }
+        } catch {
+            VDriveDiagnosticLog.shared.write("ERROR", "Массовое скачивание: \(error.localizedDescription)")
+            message = "Ошибка скачивания: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor private func autoConnectGoogleIfNeeded() async {
+        guard !autoConnectAttempted, GoogleDriveStore.shared.hasRefreshToken else { return }
+        autoConnectAttempted = true
+        await connectGoogle()
     }
 
     @MainActor private func connectGoogle() async {
-        let clientID = clientIDInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clientID.isEmpty else { showGoogleSetupInfo = true; return }
+        let clientID = clientIDInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (UserDefaults.standard.string(forKey: "googleClientID") ?? "15564278108-3npmd22j8obehjl19rpbpeeldlg2bn3k.apps.googleusercontent.com")
+            : clientIDInput.trimmingCharacters(in: .whitespacesAndNewlines)
         UserDefaults.standard.set(clientID, forKey: "googleClientID")
         do {
             try await GoogleDriveStore.shared.connect(clientID: clientID)
             isConnected = true
             message = "Google подключён. Проверяю защищённое хранилище…"
+            var autoKeyMismatch = false
 
-            // Prefer automatic recovery, but validate the candidate against every
-            // local encrypted file before changing Keychain.
+            // Prefer automatic recovery, but never replace an existing device key
+            // merely because the local originals are now plaintext.
             if let autoKey = try await GoogleDriveStore.shared.fetchAutoKey() {
                 let candidate = SymmetricKey(data: autoKey)
                 if autoKey.count == 32, await localFilesMatchKey(candidate) {
@@ -1799,8 +2081,9 @@ struct VDriveHomeView: View {
                     message = "VDrive разблокирован через Google. Секретный ключ вводить не нужно."
                     return
                 }
+                autoKeyMismatch = true
                 cloudVaultUnlocked = false
-                message = "Автоматический ключ не совпал с локальными файлами. Ничего не заменено; потребуется безопасное восстановление."
+                message = "Автоматический ключ Google не совпадает с ключом на этом устройстве. Ключ не заменён; проверь, что вошёл в нужный аккаунт."
             }
 
             if let record = try await GoogleDriveStore.shared.fetchCloudKeyRecord() {
@@ -1809,8 +2092,9 @@ struct VDriveHomeView: View {
                 // With no local proof (e.g. after reinstall), retain the one-time code flow.
                 let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
                     .filter { $0.pathExtension == "vdrive" }
-                if !localURLs.isEmpty, let localKey = try? VDriveCrypto.localKey(),
-                   await localFilesMatchKey(localKey) {
+                if !autoKeyMismatch, !localURLs.isEmpty,
+                   let localKeyData = VDriveCrypto.existingLocalKeyData(),
+                   await localFilesMatchKey(SymmetricKey(data: localKeyData)) {
                     do {
                         try await GoogleDriveStore.shared.createAutoKeyIfMissing(try VDriveCrypto.localKeyData())
                         cloudVaultUnlocked = true
@@ -1845,9 +2129,9 @@ struct VDriveHomeView: View {
             do { try await GoogleDriveStore.shared.createAutoKeyIfMissing(try VDriveCrypto.localKeyData()) }
             catch { message = "Облако создано, но авто-восстановление не сохранилось: \(error.localizedDescription)" }
             recoveryCode = result.code
-            cloudVaultUnlocked = false
+            cloudVaultUnlocked = true
             showRecoveryCodeAlert = true
-            message = "Секретный ключ создан. Сохрани его, чтобы восстановить доступ после переустановки."
+            message = "Ключ создан и сохранён. Его можно посмотреть и скопировать в настройках."
         } catch {
             message = "Google Drive: \(error.localizedDescription)"
         }
@@ -1861,40 +2145,7 @@ struct VDriveHomeView: View {
             // Decode without changing Keychain first. If local files use another key,
             // preserve the current key and ask the user to resolve the vault mismatch.
             let candidateKey = try VDriveCrypto.cloudKey(from: record, code: recoveryCodeInput)
-            let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
-                .filter { $0.pathExtension == "vdrive" }
-
-            // Most users are unlocking the cloud on the same installation that encrypted
-            // the local files. Compare the 32-byte Keychain key first: decrypting every
-            // photo/video just to prove a key we already have can exhaust iPhone memory.
-            let currentKey = try? VDriveCrypto.localKey()
-            let keychainMatches = currentKey.map { current in
-                current.withUnsafeBytes { Data($0) } == candidateKey.withUnsafeBytes { Data($0) }
-            } ?? false
-
-            let localFilesMatch: Bool
-            if keychainMatches {
-                localFilesMatch = true
-            } else {
-                // After a reinstall or Keychain mismatch, validate sequentially off the
-                // main thread and release each decrypted payload before reading the next.
-                localFilesMatch = await Task.detached(priority: .utility) { () -> Bool in
-                    for url in localURLs {
-                        let matches = autoreleasepool { () -> Bool in
-                            do {
-                                let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
-                                let plaintext = try VDriveCrypto.open(encrypted, key: candidateKey)
-                                _ = plaintext.count
-                                return true
-                            } catch {
-                                return false
-                            }
-                        }
-                        if !matches { return false }
-                    }
-                    return true
-                }.value
-            }
+            let localFilesMatch = await localFilesMatchKey(candidateKey)
 
             guard localFilesMatch else {
                 recoveryCodeInput = ""
@@ -1925,15 +2176,25 @@ struct VDriveHomeView: View {
     }
 
     private func localFilesMatchKey(_ candidateKey: SymmetricKey) async -> Bool {
-        let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
+        let candidateData = candidateKey.withUnsafeBytes { Data($0) }
+        if let storedKey = VDriveCrypto.existingLocalKeyData() {
+            if storedKey == candidateData { return true }
+        } else {
+            // A fresh installation has no local proof to compare; the private
+            // Google Drive appData key copy is the recovery source.
+            let hasLocalFiles = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: nil)) ?? [])
+                .contains { $0.pathExtension == "vdrive" }
+            if !hasLocalFiles { return true }
+        }
+
+        let localURLs = ((try? FileManager.default.contentsOfDirectory(at: documentsURL(), includingPropertiesForKeys: [.fileSizeKey])) ?? [])
             .filter { $0.pathExtension == "vdrive" }
-        let currentKey = try? VDriveCrypto.localKey()
-        let keychainMatches = currentKey.map { current in
-            current.withUnsafeBytes { Data($0) } == candidateKey.withUnsafeBytes { Data($0) }
-        } ?? false
-        if keychainMatches { return true }
-        return await Task.detached(priority: .utility) { () -> Bool in
-            for url in localURLs {
+        let plainPaths = Set(localURLs.filter { isClearlyPlaintextFile($0) }.map { $0.path })
+        let validation = await Task.detached(priority: .utility) { () -> (valid: Bool, provedByLegacyFile: Bool) in
+            var provedByLegacyFile = false
+            for url in localURLs where !plainPaths.contains(url.path) {
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard size <= 256 * 1024 * 1024 else { return (false, false) }
                 let matches = autoreleasepool { () -> Bool in
                     do {
                         let encrypted = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -1941,10 +2202,17 @@ struct VDriveHomeView: View {
                         return true
                     } catch { return false }
                 }
-                if !matches { return false }
+                if !matches { return (false, false) }
+                provedByLegacyFile = true
             }
-            return true
+            return (true, provedByLegacyFile)
         }.value
+        guard validation.valid else { return false }
+        // A different existing Keychain key may only be replaced if a legacy
+        // encrypted local file proves the candidate, not merely because files are plaintext.
+        return VDriveCrypto.existingLocalKeyData() == nil
+            || VDriveCrypto.existingLocalKeyData() == candidateData
+            || validation.provedByLegacyFile
     }
 
     private func pinDigest(_ value: String) -> String {
@@ -1960,10 +2228,117 @@ struct VDriveHomeView: View {
         }
         context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Разблокировать VDrive") { success, authError in
             DispatchQueue.main.async {
-                if success { locked = false; showingAuthenticator = false; pinEntry = ""; Task { await refreshCloudInventory() } }
+                if success { locked = false; showingAuthenticator = false; pinEntry = ""; Task { await autoConnectGoogleIfNeeded(); await refreshCloudInventory() } }
                 else { message = authError?.localizedDescription ?? "Не удалось разблокировать" }
             }
         }
+    }
+}
+
+
+/// Stream network transfers to disk and report actual byte counts.
+private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+    private let progress: (Int64, Int64, Double) -> Void
+    private var session: URLSession!
+    private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+    private var responseData = Data()
+    private var outputHandle: FileHandle?
+    private var lastReport = Date.distantPast
+    private var lastBytes: Int64 = 0
+    private var lastDate = Date()
+    private var speed: Double = 0
+    private var receivedDownloadBytes: Int64 = 0
+    private var expectedDownloadBytes: Int64 = 0
+
+    init(progress: @escaping (Int64, Int64, Double) -> Void) {
+        self.progress = progress
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue())
+    }
+
+    func download(_ request: URLRequest) async throws -> (URL, URLResponse) {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("vdrive-download-\(UUID().uuidString).part")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        outputHandle = try FileHandle(forWritingTo: url)
+        do {
+            let (_, response) = try await perform(request, uploadFile: nil)
+            try outputHandle?.close()
+            outputHandle = nil
+            return (url, response)
+        } catch {
+            try? outputHandle?.close()
+            outputHandle = nil
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+    }
+
+    func upload(_ request: URLRequest, file: URL) async throws -> (Data, URLResponse) {
+        try await perform(request, uploadFile: file)
+    }
+
+    private func perform(_ request: URLRequest, uploadFile: URL?) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            responseData = Data()
+            receivedDownloadBytes = 0
+            expectedDownloadBytes = 0
+            lastBytes = 0
+            lastDate = Date()
+            lastReport = .distantPast
+            let task: URLSessionTask = uploadFile.map { session.uploadTask(with: request, fromFile: $0) } ?? session.dataTask(with: request)
+            task.resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if let outputHandle {
+            do {
+                try outputHandle.write(contentsOf: data)
+                receivedDownloadBytes += Int64(data.count)
+                report(receivedDownloadBytes, expectedDownloadBytes)
+            } catch { dataTask.cancel() }
+        } else { responseData.append(data) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        report(totalBytesSent, totalBytesExpectedToSend)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if outputHandle != nil {
+            expectedDownloadBytes = response.expectedContentLength
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                completionHandler(.cancel)
+                return
+            }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let continuation else { return }
+        self.continuation = nil
+        if let error { continuation.resume(throwing: error); return }
+        guard let response = task.response else { continuation.resume(throwing: DriveError.invalidResponse); return }
+        continuation.resume(returning: (outputHandle == nil ? responseData : Data(), response))
+    }
+
+    private func report(_ bytes: Int64, _ total: Int64) {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastDate)
+        if elapsed >= 0.05 {
+            speed = Double(max(0, bytes - lastBytes)) / elapsed
+            lastBytes = bytes
+            lastDate = now
+        }
+        guard now.timeIntervalSince(lastReport) >= 0.2 || (total > 0 && bytes >= total) else { return }
+        lastReport = now
+        let callback = progress
+        let currentSpeed = speed
+        DispatchQueue.main.async { callback(bytes, total, currentSpeed) }
     }
 }
 
@@ -1973,6 +2348,20 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
     private let mapKey = "vdrive.google.fileMap"
     private var clientID = ""
     private var accessToken = ""
+    private let downloadLock = NSLock()
+    private var activeDownloadIDs = Set<String>()
+    private func beginDownload(_ id: String) -> Bool {
+        downloadLock.lock()
+        defer { downloadLock.unlock() }
+        guard !activeDownloadIDs.contains(id) else { return false }
+        activeDownloadIDs.insert(id)
+        return true
+    }
+    private func endDownload(_ id: String) {
+        downloadLock.lock()
+        activeDownloadIDs.remove(id)
+        downloadLock.unlock()
+    }
     var fileIDs: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: mapKey) as? [String: String] ?? [:] }
         set { UserDefaults.standard.set(newValue, forKey: mapKey) }
@@ -1980,11 +2369,31 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
     var hasRefreshToken: Bool { readKeychain() != nil }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }.first { $0.isKeyWindow } ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.windows.first ?? UIWindow()
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let keyWindow = scenes.flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) {
+            return keyWindow
+        }
+        if let firstWindow = scenes.first?.windows.first {
+            return firstWindow
+        }
+        if let scene = scenes.first {
+            return UIWindow(windowScene: scene)
+        }
+        fatalError("No active UIWindowScene available")
     }
 
     func connect(clientID: String) async throws {
         self.clientID = clientID
+        if hasRefreshToken {
+            do {
+                try await ensureAccessToken()
+                VDriveDiagnosticLog.shared.write("AUTH", "Существующая Google-сессия восстановлена из Keychain; OAuth экран не открывался")
+                return
+            } catch {
+                accessToken = ""
+                VDriveDiagnosticLog.shared.write("AUTH", "Сохранённый refresh token недействителен; потребуется повторная авторизация")
+            }
+        }
         let prefix = clientID.replacingOccurrences(of: ".apps.googleusercontent.com", with: "")
         let scheme = "com.googleusercontent.apps.\(prefix)"
         let redirect = "\(scheme):/oauth2redirect"
@@ -2001,9 +2410,11 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             URLQueryItem(name: "code_challenge_method", value: "S256"),
             URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "access_type", value: "offline"),
-            URLQueryItem(name: "prompt", value: "consent")
+            URLQueryItem(name: "include_granted_scopes", value: "true")
         ]
+        if !hasRefreshToken { components.queryItems?.append(URLQueryItem(name: "prompt", value: "consent")) }
         guard let authURL = components.url else { throw DriveError.invalidResponse }
+        VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \(hasRefreshToken)")
         let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: scheme) { url, error in
                 if let error { continuation.resume(throwing: error); return }
@@ -2037,7 +2448,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
         let token = try JSONDecoder().decode(TokenResponse.self, from: data)
         accessToken = token.access_token
-        if let refresh = token.refresh_token { try saveKeychain(refresh) }
+        if let refresh = token.refresh_token, !refresh.isEmpty { try saveKeychain(refresh) }
+        VDriveDiagnosticLog.shared.write("AUTH", "OAuth завершён; refresh token сохранён: \(hasRefreshToken)")
     }
 
     func fetchCloudKeyRecord() async throws -> Data? {
@@ -2169,9 +2581,24 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
     }
 
-    func upload(_ file: URL) async throws {
+    func uploadPlainFile(_ plaintextFile: URL, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
+        let stagingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VDrive-cloud-upload-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+        let encryptedFile = stagingDirectory.appendingPathComponent(plaintextFile.lastPathComponent)
+        try await Task.detached(priority: .utility) {
+            try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
+        }.value
+        try await upload(encryptedFile, progress: progress)
+        var map = fileIDs
+        map[plaintextFile.lastPathComponent] = map.removeValue(forKey: encryptedFile.lastPathComponent)
+        fileIDs = map
+    }
+
+    func upload(_ file: URL, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
         try await ensureAccessToken()
-        // Assemble the multipart request on disk so large videos are not duplicated in RAM.
+        // Assemble multipart body on disk; do not duplicate large encrypted videos in RAM.
         let boundary = "vdrive-\(UUID().uuidString)"
         let metadata: [String: Any] = ["name": file.lastPathComponent, "mimeType": "application/octet-stream"]
         let metadataData = try JSONSerialization.data(withJSONObject: metadata)
@@ -2194,7 +2621,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         request.httpMethod = "POST"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/related; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let (responseData, response) = try await URLSession.shared.upload(for: request, fromFile: bodyURL)
+        let transfer = VDriveTransferSession(progress: progress)
+        let (responseData, response) = try await transfer.upload(request, file: bodyURL)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DriveError.server(String(data: responseData, encoding: .utf8) ?? "Upload error")
         }
@@ -2244,15 +2672,72 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return remote
     }
 
-    func downloadFile(driveID: String, name: String, to directory: URL) async throws {
+    func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
+        let started = Date()
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Начало; driveID=\(driveID.prefix(8)); extension=\((name as NSString).pathExtension)")
+        guard beginDownload(driveID) else {
+            VDriveDiagnosticLog.shared.write("DOWNLOAD", "Повторный запрос пропущен: файл уже скачивается; id=\(driveID.prefix(8))")
+            throw DriveError.server("Этот файл уже скачивается. Дождись завершения текущей загрузки.")
+        }
+        defer { endDownload(driveID) }
         try await ensureAccessToken()
+        let metadataURL = URL(string: "https://www.googleapis.com/drive/v3/files/\(driveID)?fields=size")!
+        var metadataRequest = URLRequest(url: metadataURL)
+        metadataRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        let (metadataData, metadataResponse) = try await URLSession.shared.data(for: metadataRequest)
+        guard let metadataHTTP = metadataResponse as? HTTPURLResponse, (200..<300).contains(metadataHTTP.statusCode) else {
+            throw DriveError.server("Не удалось проверить размер файла перед скачиванием.")
+        }
+        let metadata = try JSONDecoder().decode(DriveFileMetadata.self, from: metadataData)
+        let remoteSize = Int64(metadata.size ?? "") ?? 0
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Метаданные получены; bytes=\(remoteSize)")
+        if remoteSize > 256 * 1024 * 1024 {
+            var rangeRequest = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(driveID)?alt=media")!)
+            rangeRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            rangeRequest.setValue("bytes=0-7", forHTTPHeaderField: "Range")
+            let (rangeURL, rangeResponse) = try await URLSession.shared.download(for: rangeRequest)
+            defer { try? FileManager.default.removeItem(at: rangeURL) }
+            guard let rangeHTTP = rangeResponse as? HTTPURLResponse, rangeHTTP.statusCode == 206 else {
+                throw DriveError.server("Google Drive не поддержал безопасную проверку формата большого файла. Скачивание отменено.")
+            }
+            let prefix = try Data(contentsOf: rangeURL)
+            guard prefix == Data("VDRCHNK1".utf8) else {
+                VDriveDiagnosticLog.shared.write("DOWNLOAD", "Отмена до полной загрузки: старый монолитный формат; bytes=\(remoteSize)")
+                throw DriveError.server("Старый формат шифрования, файл слишком велик для безопасной загрузки на iPhone (\(ByteCountFormatter.string(fromByteCount: remoteSize, countStyle: .file))). Нужна повторная выгрузка оригинала.")
+            }
+            VDriveDiagnosticLog.shared.write("DOWNLOAD", "Большой файл подтверждён как потоковый формат")
+        }
+
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let transfer = VDriveTransferSession(progress: progress)
+        let (downloadedURL, response) = try await transfer.download(request)
+        let downloadedBytes = (try? downloadedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Ответ Drive; HTTP=\(status); bytes=\(downloadedBytes); seconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            try? FileManager.default.removeItem(at: downloadedURL)
+            VDriveDiagnosticLog.shared.write("ERROR", "HTTP ошибка скачивания; status=\(status)")
             throw DriveError.server("Не удалось скачать " + name)
         }
-        try data.write(to: directory.appendingPathComponent(name), options: [.atomic, .completeFileProtection])
+        let destination = directory.appendingPathComponent(name)
+        let staging = directory.appendingPathComponent("." + UUID().uuidString + ".vdrive-part")
+        defer { try? FileManager.default.removeItem(at: downloadedURL); try? FileManager.default.removeItem(at: staging) }
+        VDriveDiagnosticLog.shared.write("DECRYPT", "Начало; bytes=\(downloadedBytes)")
+        do {
+            try await Task.detached(priority: .utility) { try VDriveCrypto.decryptFile(at: downloadedURL, to: staging, key: key) }.value
+        } catch {
+            VDriveDiagnosticLog.shared.write("ERROR", "Расшифровка: \(error.localizedDescription)")
+            throw error
+        }
+        VDriveDiagnosticLog.shared.write("DECRYPT", "Завершено; seconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: staging)
+        } else {
+            try FileManager.default.moveItem(at: staging, to: destination)
+        }
+        VDriveCrypto.markLocalPlaintextFile(destination)
+        VDriveDiagnosticLog.shared.write("DOWNLOAD", "Сохранено; localBytes=\((try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0); totalSeconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
     }
 
     func downloadThumbnail(named name: String) async throws -> Data? {
@@ -2280,14 +2765,14 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return data
     }
 
-    func downloadMissing(to directory: URL, localNames: Set<String>) async throws -> Int {
+    func downloadMissing(to directory: URL, localNames: Set<String>, key: SymmetricKey) async throws -> Int {
         try await ensureAccessToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
         components.queryItems = [
             URLQueryItem(name: "spaces", value: "drive"),
             URLQueryItem(name: "pageSize", value: "1000"),
             URLQueryItem(name: "q", value: "trashed = false"),
-            URLQueryItem(name: "fields", value: "files(id,name)")
+            URLQueryItem(name: "fields", value: "files(id,name,size)")
         ]
         var listRequest = URLRequest(url: components.url!)
         listRequest.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
@@ -2299,30 +2784,23 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         var map = fileIDs
         for item in remote where item.name.hasSuffix(".vdrive") { map[item.name] = item.id }
         fileIDs = map
-        // Re-scan the destination instead of trusting the caller's snapshot.
-        // Restore must never overwrite a file that is already on this device.
         let diskNames = Set(((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "vdrive" }
-            .map { $0.lastPathComponent })
-        let existingNames = localNames.union(diskNames)
+            .filter { $0.pathExtension == "vdrive" }.map { $0.lastPathComponent })
+        var existingNames = localNames.union(diskNames)
+        let pending = remote.filter { $0.name.hasSuffix(".vdrive") && !existingNames.contains($0.name) }
+        VDriveDiagnosticLog.shared.write("SYNC", "Файлов в облаке=\(remote.count); отсутствуют локально=\(pending.count)")
         var count = 0
-        for item in remote where item.name.hasSuffix(".vdrive") && !existingNames.contains(item.name) {
+        for item in pending {
             let destination = directory.appendingPathComponent(item.name)
-            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
-            var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(item.id)?alt=media")!)
-            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw DriveError.server("Не удалось скачать \(item.name)")
-            }
-            // Re-check just before writing to avoid clobbering a file created while downloading.
-            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
-            try data.write(to: destination, options: [.atomic, .completeFileProtection])
+            guard !FileManager.default.fileExists(atPath: destination.path) else { existingNames.insert(item.name); continue }
+            VDriveDiagnosticLog.shared.write("SYNC", "Очередь: \(item.name); cloudBytes=\(item.size ?? "unknown")")
+            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key)
+            existingNames.insert(item.name)
             count += 1
+            VDriveDiagnosticLog.shared.write("SYNC", "Завершён файл \(item.name); \(count)/\(pending.count)")
         }
         return count
     }
-
     private func deleteDriveFile(named name: String) async throws {
         try await ensureAccessToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
@@ -2376,11 +2854,13 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
     func disconnect() {
         accessToken = ""
         deleteKeychain()
+        VDriveDiagnosticLog.shared.write("AUTH", "Google Drive отключён пользователем")
     }
 
     private func ensureAccessToken() async throws {
         if !accessToken.isEmpty { return }
-        guard let refresh = readKeychain() else { throw DriveError.needsLogin }
+        guard let refresh = readKeychain() else { VDriveDiagnosticLog.shared.write("AUTH", "Refresh token отсутствует в Keychain"); throw DriveError.needsLogin }
+        VDriveDiagnosticLog.shared.write("AUTH", "Обновление access token сохранённым refresh token")
         if clientID.isEmpty {
             clientID = UserDefaults.standard.string(forKey: "googleClientID") ?? "15564278108-3npmd22j8obehjl19rpbpeeldlg2bn3k.apps.googleusercontent.com"
         }
@@ -2400,6 +2880,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             throw DriveError.server(String(data: data, encoding: .utf8) ?? "Token refresh error")
         }
         accessToken = try JSONDecoder().decode(TokenResponse.self, from: data).access_token
+        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \(http.statusCode)")
     }
 
     private func readKeychain() -> String? {
@@ -2432,6 +2913,7 @@ private struct TokenResponse: Decodable {
     let refresh_token: String?
 }
 private struct DriveFileResponse: Decodable { let id: String; let name: String; let size: String? }
+private struct DriveFileMetadata: Decodable { let size: String? }
 private struct DriveFileList: Decodable { let files: [DriveFileResponse] }
 private struct RemoteFileIDs: Decodable {
     struct Item: Decodable { let id: String }
@@ -2508,8 +2990,8 @@ private struct VaultFullscreenViewer: View {
     @State private var controlsVisible = true
 
     private var current: PreviewItem? { items.indices.contains(index) ? items[index] : nil }
-    private var isVideo: Bool { current.flatMap { UTType(filenameExtension: $0.url.pathExtension)?.conforms(to: .movie) } ?? false }
-    private var isImage: Bool { current.flatMap { UTType(filenameExtension: $0.url.pathExtension)?.conforms(to: .image) } ?? false }
+    private var isVideo: Bool { current.flatMap { UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .movie) } ?? false }
+    private var isImage: Bool { current.flatMap { UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) } ?? false }
 
     var body: some View {
         ZStack {
@@ -2594,7 +3076,7 @@ private struct VaultFullscreenViewer: View {
         isPlaying = false
         playhead = 0
         duration = 0
-        guard let current, UTType(filenameExtension: current.url.pathExtension)?.conforms(to: .movie) == true else { return }
+        guard let current, UTType(filenameExtension: URL(fileURLWithPath: current.name).pathExtension)?.conforms(to: .movie) == true else { return }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [])
             try AVAudioSession.sharedInstance().setActive(true)
