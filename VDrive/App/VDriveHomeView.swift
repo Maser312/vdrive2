@@ -2679,7 +2679,6 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
         accessToken = try JSONDecoder().decode(TokenResponse.self, from: data).access_token
         VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \(http.statusCode)")
-        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \(http.statusCode)")
     }
 
     private func readKeychain() -> String? {
