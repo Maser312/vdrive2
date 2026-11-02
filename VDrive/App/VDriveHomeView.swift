@@ -1985,7 +1985,8 @@ struct VDriveHomeView: View {
         } catch { message = "Ошибка Google Drive: \(error.localizedDescription)" }
     }
 
-    @MainActor private func downloadMissing() async {\n        VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
+    @MainActor private func downloadMissing() async {
+        VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
         busy = true
@@ -2000,7 +2001,8 @@ struct VDriveHomeView: View {
         }
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())\n            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())
+            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
             transferProgress = count
             transferTotal = max(count, 1)
             transferLabel = "Загрузка из Google Drive завершена"
@@ -2233,7 +2235,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             URLQueryItem(name: "include_granted_scopes", value: "true")
         ]
         guard let authURL = components.url else { throw DriveError.invalidResponse }
-        VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \(hasRefreshToken)")\n        let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+        VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \(hasRefreshToken)")
+        let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: scheme) { url, error in
                 if let error { continuation.resume(throwing: error); return }
                 guard let url else { continuation.resume(throwing: DriveError.invalidResponse); return }
