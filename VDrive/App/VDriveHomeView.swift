@@ -842,18 +842,26 @@ struct VDriveHomeView: View {
                                         .font(.footnote.weight(.medium))
                                         .lineLimit(2)
                                     Spacer(minLength: 4)
-                                    if transferTotal > 0 {
+                                    if transferExpectedBytes > 0 {
+                                        Text("\(ByteCountFormatter.string(fromByteCount: transferBytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: transferExpectedBytes, countStyle: .file))")
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    } else if transferTotal > 0 {
                                         Text("\(transferProgress)/\(transferTotal)")
                                             .font(.caption.monospacedDigit())
                                             .foregroundStyle(.secondary)
                                     }
                                 }
-                                if transferTotal > 0 {
-                                    ProgressView(value: Double(min(transferProgress, transferTotal)), total: Double(transferTotal))
-                                        .tint(.primary)
-                                } else {
-                                    ProgressView()
-                                }
+                                if transferExpectedBytes > 0 {
+                                    ProgressView(value: Double(min(transferBytes, transferExpectedBytes)), total: Double(transferExpectedBytes)).tint(.primary)
+                                    HStack {
+                                        Text("\(Int(Double(transferBytes) / Double(max(transferExpectedBytes, 1)) * 100))%")
+                                        Spacer()
+                                        Text("\(ByteCountFormatter.string(fromByteCount: Int64(transferSpeedBytesPerSecond), countStyle: .file))/с")
+                                    }.font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                                } else if transferTotal > 0 {
+                                    ProgressView(value: Double(min(transferProgress, transferTotal)), total: Double(transferTotal)).tint(.primary)
+                                } else { ProgressView() }
                             }
                             .padding(12)
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
@@ -1877,15 +1885,25 @@ struct VDriveHomeView: View {
         busy = true
         transferProgress = 0
         transferTotal = 2
-        transferLabel = "Выгрузка файла в Google Drive"
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
+        transferLabel = "Шифрую и выгружаю в Google Drive…"
         defer {
             busy = false
             transferLabel = ""
             transferProgress = 0
             transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
         }
         do {
-            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
+            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+                self.transferBytes = sent
+                self.transferExpectedBytes = total
+                self.transferSpeedBytesPerSecond = speed
+            }
             transferProgress = 1
             transferLabel = "Файл выгружен. Загружаю миниатюру…"
             let thumb = try await Task.detached(priority: .utility) {
@@ -1907,15 +1925,25 @@ struct VDriveHomeView: View {
         busy = true
         transferProgress = 0
         transferTotal = 1
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
         transferLabel = "Скачиваю файл с Google Drive…"
         defer {
             busy = false
             transferLabel = ""
             transferProgress = 0
             transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
         }
         do {
-            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey())
+            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey()) { received, total, speed in
+                self.transferBytes = received
+                self.transferExpectedBytes = total
+                self.transferSpeedBytesPerSecond = speed
+            }
             transferProgress = 1
             refreshFiles()
             message = "Файл скачан на устройство."
@@ -2213,6 +2241,100 @@ struct VDriveHomeView: View {
     }
 }
 
+
+/// Stream network transfers to disk and report actual byte counts.
+private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+    private let progress: (Int64, Int64, Double) -> Void
+    private var session: URLSession!
+    private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+    private var responseData = Data()
+    private var outputHandle: FileHandle?
+    private var lastReport = Date.distantPast
+    private var lastBytes: Int64 = 0
+    private var lastDate = Date()
+    private var speed: Double = 0
+
+    init(progress: @escaping (Int64, Int64, Double) -> Void) {
+        self.progress = progress
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = true
+        session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue())
+    }
+
+    func download(_ request: URLRequest) async throws -> (URL, URLResponse) {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("vdrive-download-\(UUID().uuidString).part")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        outputHandle = try FileHandle(forWritingTo: url)
+        do {
+            let (_, response) = try await perform(request, uploadFile: nil)
+            try outputHandle?.close()
+            outputHandle = nil
+            return (url, response)
+        } catch {
+            try? outputHandle?.close()
+            outputHandle = nil
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+    }
+
+    func upload(_ request: URLRequest, file: URL) async throws -> (Data, URLResponse) {
+        try await perform(request, uploadFile: file)
+    }
+
+    private func perform(_ request: URLRequest, uploadFile: URL?) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            self.continuation = continuation
+            responseData = Data()
+            lastBytes = 0
+            lastDate = Date()
+            lastReport = .distantPast
+            let task: URLSessionTask = uploadFile.map { session.uploadTask(with: request, fromFile: $0) } ?? session.dataTask(with: request)
+            task.resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if let outputHandle {
+            do { try outputHandle.write(contentsOf: data) } catch { dataTask.cancel() }
+        } else { responseData.append(data) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        report(totalBytesSent, totalBytesExpectedToSend)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if outputHandle != nil, let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            completionHandler(.cancel)
+        } else { completionHandler(.allow) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let continuation else { return }
+        self.continuation = nil
+        if let error { continuation.resume(throwing: error); return }
+        guard let response = task.response else { continuation.resume(throwing: DriveError.invalidResponse); return }
+        continuation.resume(returning: (outputHandle == nil ? responseData : Data(), response))
+    }
+
+    private func report(_ bytes: Int64, _ total: Int64) {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastDate)
+        if elapsed >= 0.05 {
+            speed = Double(max(0, bytes - lastBytes)) / elapsed
+            lastBytes = bytes
+            lastDate = now
+        }
+        guard now.timeIntervalSince(lastReport) >= 0.2 || (total > 0 && bytes >= total) else { return }
+        lastReport = now
+        let callback = progress
+        let currentSpeed = speed
+        DispatchQueue.main.async { callback(bytes, total, currentSpeed) }
+    }
+}
+
 private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationContextProviding {
     static let shared = GoogleDriveStore()
     private let tokenAccount = "vdrive.google.refresh"
@@ -2452,7 +2574,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
     }
 
-    func uploadPlainFile(_ plaintextFile: URL, key: SymmetricKey) async throws {
+    func uploadPlainFile(_ plaintextFile: URL, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
         let stagingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VDrive-cloud-upload-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
@@ -2461,13 +2583,13 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         try await Task.detached(priority: .utility) {
             try VDriveCrypto.encryptFile(at: plaintextFile, to: encryptedFile, key: key)
         }.value
-        try await upload(encryptedFile)
+        try await upload(encryptedFile, progress: progress)
         var map = fileIDs
         map[plaintextFile.lastPathComponent] = map.removeValue(forKey: encryptedFile.lastPathComponent)
         fileIDs = map
     }
 
-    func upload(_ file: URL) async throws {
+    func upload(_ file: URL, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
         try await ensureAccessToken()
         // Assemble multipart body on disk; do not duplicate large encrypted videos in RAM.
         let boundary = "vdrive-\(UUID().uuidString)"
@@ -2492,7 +2614,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         request.httpMethod = "POST"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/related; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let (responseData, response) = try await URLSession.shared.upload(for: request, fromFile: bodyURL)
+        let transfer = VDriveTransferSession(progress: progress)
+        let (responseData, response) = try await transfer.upload(request, file: bodyURL)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DriveError.server(String(data: responseData, encoding: .utf8) ?? "Upload error")
         }
@@ -2542,7 +2665,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return remote
     }
 
-    func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey) async throws {
+    func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
         let started = Date()
         VDriveDiagnosticLog.shared.write("DOWNLOAD", "Начало; driveID=\(driveID.prefix(8)); extension=\((name as NSString).pathExtension)")
         guard beginDownload(driveID) else {
@@ -2580,7 +2703,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
 
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
-        let (downloadedURL, response) = try await URLSession.shared.download(for: request)
+        let transfer = VDriveTransferSession(progress: progress)
+        let (downloadedURL, response) = try await transfer.download(request)
         let downloadedBytes = (try? downloadedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         VDriveDiagnosticLog.shared.write("DOWNLOAD", "Ответ Drive; HTTP=\(status); bytes=\(downloadedBytes); seconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
