@@ -2119,7 +2119,7 @@ struct VDriveHomeView: View {
                 }
                 transferLabel = "Создаю квадратную миниатюру: \(index + 1) из \(localFiles.count)"
                 let thumb = try await Task.detached(priority: .utility) {
-                    try self.makeEncryptedThumbnail(for: file.url)
+                    try await self.makeEncryptedThumbnail(for: file.url)
                 }.value
                 if let thumb {
                     transferLabel = "Передаю миниатюру: \(index + 1) из \(localFiles.count)"
