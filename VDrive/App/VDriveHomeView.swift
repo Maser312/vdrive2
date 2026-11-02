@@ -311,11 +311,55 @@ private struct VaultThumbnail: View {
         let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv", "3gp", "3g2"]
         let mediaImage: UIImage?
         if videoExtensions.contains(ext) {
-            let asset = AVURLAsset(url: url)
+            // Vault originals are stored as *.vdrive, while the real media type is
+            // encoded in the vault ID (filename). AVFoundation may reject an
+            // unknown .vdrive extension before inspecting the movie container.
+            // Create a zero-copy hard link with the original extension so the
+            // asset loader sees .mp4/.mov/etc. Never duplicate large video data.
+            var temporaryAssetURL: URL?
+            let assetURL: URL
+            if !ext.isEmpty && url.pathExtension.lowercased() != ext {
+                let alias = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("VDrive-video-\(UUID().uuidString)")
+                    .appendingPathExtension(ext)
+                do {
+                    try FileManager.default.linkItem(at: url, to: alias)
+                    assetURL = alias
+                    temporaryAssetURL = alias
+                } catch {
+                    // A symbolic link is also zero-copy and is a safe fallback
+                    // on file systems that do not permit hard links.
+                    let symbolicAlias = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("VDrive-video-\(UUID().uuidString)")
+                        .appendingPathExtension(ext)
+                    do {
+                        try FileManager.default.createSymbolicLink(at: symbolicAlias, withDestinationURL: url)
+                        assetURL = symbolicAlias
+                        temporaryAssetURL = symbolicAlias
+                    } catch {
+                        VDriveDiagnosticLog.shared.write("THUMB", "Could not create video alias; using vault URL: \(error.localizedDescription)")
+                        assetURL = url
+                    }
+                }
+            } else {
+                assetURL = url
+            }
+            defer {
+                if let temporaryAssetURL {
+                    try? FileManager.default.removeItem(at: temporaryAssetURL)
+                }
+            }
+
+            let asset = AVURLAsset(url: assetURL)
             do {
-                guard try await asset.load(.isPlayable) else { return nil }
+                guard try await asset.load(.isPlayable) else {
+                    VDriveDiagnosticLog.shared.write("THUMB", "Video is not playable for thumbnail; ext=\(ext), urlExt=\(url.pathExtension)")
+                    return nil
+                }
                 let duration = try await asset.load(.duration)
-                let seconds = duration.isNumeric && duration.seconds.isFinite ? max(0, min(1.0, duration.seconds * 0.1)) : 0.5
+                let seconds = duration.isNumeric && duration.seconds.isFinite
+                    ? max(0, min(1.0, duration.seconds * 0.1))
+                    : 0.5
                 let generator = AVAssetImageGenerator(asset: asset)
                 generator.appliesPreferredTrackTransform = true
                 generator.maximumSize = CGSize(width: 640, height: 640)
@@ -324,7 +368,7 @@ private struct VaultThumbnail: View {
                 let frame = try await generator.image(at: CMTime(seconds: seconds, preferredTimescale: 600)).image
                 mediaImage = UIImage(cgImage: frame)
             } catch {
-                VDriveDiagnosticLog.shared.write("THUMB", "Video thumbnail failed: \(error.localizedDescription)")
+                VDriveDiagnosticLog.shared.write("THUMB", "Video thumbnail failed; ext=\(ext): \(error.localizedDescription)")
                 return nil
             }
         } else {
