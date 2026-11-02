@@ -252,9 +252,12 @@ private struct VaultThumbnail: View {
         let key = try VDriveCrypto.localKey()
         // Prefer the new full-bleed square preview. Fall back to legacy for cloud-only items.
         let currentPreview = try await GoogleDriveStore.shared.downloadThumbnail(named: file.id + ".vthumb2")
-        let encryptedPreview = try await (currentPreview == nil
-            ? GoogleDriveStore.shared.downloadThumbnail(named: file.id + ".vthumb")
-            : currentPreview)
+        let encryptedPreview: Data?
+        if let currentPreview {
+            encryptedPreview = currentPreview
+        } else {
+            encryptedPreview = try await GoogleDriveStore.shared.downloadThumbnail(named: file.id + ".vthumb")
+        }
         guard let encryptedPreview else { return nil }
         let jpeg = try await Task.detached(priority: .utility) {
             try await ThumbnailCryptoQueue.shared.decrypt(encryptedPreview, key: key)
@@ -299,6 +302,7 @@ private struct VaultThumbnail: View {
 
     nonisolated static func removeLocalThumbnail(for fileID: String) {
         try? FileManager.default.removeItem(at: localThumbnailURL(for: fileID))
+        try? FileManager.default.removeItem(at: thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".vthumb"))
         try? FileManager.default.removeItem(at: legacyLocalThumbnailURL(for: fileID))
     }
 
@@ -1108,13 +1112,37 @@ struct VDriveHomeView: View {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         let targets = selectedFiles.filter { $0.isLocal && !$0.uploaded }
         busy = true
-        defer { busy = false; refreshFiles() }
+        transferProgress = 0
+        transferTotal = targets.count
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
+        transferLabel = "Выгружаю выбранные файлы…"
+        defer {
+            busy = false
+            transferLabel = ""
+            transferProgress = 0
+            transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
+            refreshFiles()
+        }
         do {
-            for file in targets {
-                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey())
+            for (index, file) in targets.enumerated() {
+                transferLabel = "Выгружаю файл \(index + 1) из \(targets.count)"
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey()) { sent, total, speed in
+                    self.transferBytes = sent
+                    self.transferExpectedBytes = total
+                    self.transferSpeedBytesPerSecond = speed
+                }
                 if let thumb = try self.makeEncryptedThumbnail(for: file.url) {
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
+                transferProgress = index + 1
+                transferBytes = 0
+                transferExpectedBytes = 0
+                transferSpeedBytesPerSecond = 0
             }
             await refreshCloudInventory()
             message = "Выбранные файлы выгружены."
