@@ -1153,11 +1153,35 @@ struct VDriveHomeView: View {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         let targets = selectedFiles.filter { !$0.isLocal }
         busy = true
-        defer { busy = false; refreshFiles() }
+        transferProgress = 0
+        transferTotal = targets.count
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
+        transferLabel = "Скачиваю выбранные файлы…"
+        defer {
+            busy = false
+            transferLabel = ""
+            transferProgress = 0
+            transferTotal = 0
+            transferBytes = 0
+            transferExpectedBytes = 0
+            transferSpeedBytesPerSecond = 0
+            refreshFiles()
+        }
         do {
-            for file in targets {
+            for (index, file) in targets.enumerated() {
                 guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { continue }
-                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey())
+                transferLabel = "Скачиваю файл \(index + 1) из \(targets.count)"
+                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey()) { received, total, speed in
+                    self.transferBytes = received
+                    self.transferExpectedBytes = total
+                    self.transferSpeedBytesPerSecond = speed
+                }
+                transferProgress = index + 1
+                transferBytes = 0
+                transferExpectedBytes = 0
+                transferSpeedBytesPerSecond = 0
             }
             await refreshCloudInventory()
             message = "Выбранные файлы скачаны."
@@ -2072,9 +2096,16 @@ struct VDriveHomeView: View {
             transferProgress = 0
             transferTotal = 0
         }
+        transferBytes = 0
+        transferExpectedBytes = 0
+        transferSpeedBytesPerSecond = 0
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey()) { received, total, speed in
+                self.transferBytes = received
+                self.transferExpectedBytes = total
+                self.transferSpeedBytesPerSecond = speed
+            }
             VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
             transferProgress = count
             transferTotal = max(count, 1)
@@ -2832,7 +2863,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return data
     }
 
-    func downloadMissing(to directory: URL, localNames: Set<String>, key: SymmetricKey) async throws -> Int {
+    func downloadMissing(to directory: URL, localNames: Set<String>, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws -> Int {
         try await ensureAccessToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
         components.queryItems = [
@@ -2861,7 +2892,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             let destination = directory.appendingPathComponent(item.name)
             guard !FileManager.default.fileExists(atPath: destination.path) else { existingNames.insert(item.name); continue }
             VDriveDiagnosticLog.shared.write("SYNC", "Очередь: \(item.name); cloudBytes=\(item.size ?? "unknown")")
-            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key)
+            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: progress)
             existingNames.insert(item.name)
             count += 1
             VDriveDiagnosticLog.shared.write("SYNC", "Завершён файл \(item.name); \(count)/\(pending.count)")
@@ -2913,6 +2944,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
         // Remove encrypted thumbnail sidecars as well; otherwise orphaned previews remain in Drive.
         try await deleteDriveFile(named: id + ".vthumb")
+        try await deleteDriveFile(named: id + ".vthumb2")
         var map = fileIDs
         map.removeValue(forKey: id)
         fileIDs = map
