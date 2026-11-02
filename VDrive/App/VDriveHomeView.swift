@@ -1520,12 +1520,7 @@ struct VDriveHomeView: View {
         let fileURL = file.url
         let displayName = file.displayName
         let addedDate = file.addedDate
-        let captureDate: Date?
-        if let storedCaptureDate = file.captureDate {
-            captureDate = storedCaptureDate
-        } else {
-            captureDate = await metadataCaptureDate(at: fileURL, filename: displayName)
-        }
+        let captureDate = await metadataCaptureDate(at: fileURL, filename: displayName) ?? file.captureDate
         do {
             let details = try await Task.detached(priority: .utility) { () throws -> String in
                 let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
@@ -1535,7 +1530,7 @@ struct VDriveHomeView: View {
                 let ext = (displayName as NSString).pathExtension.lowercased()
                 let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
                 let added = addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: addedDate, dateStyle: .medium, timeStyle: .short)
-                let captured = captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .short) } ?? "Не сохранена"
+                let captured = captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "Не сохранена"
                 var lines = [
                     "Имя: \(displayName)",
                     "Тип: \(type)",
@@ -1703,13 +1698,13 @@ struct VDriveHomeView: View {
             return temp
         }
         guard let keyData = VDriveCrypto.existingLocalKeyData() else {
-            try FileManager.default.copyItem(at: file.url, to: temp)
-            return temp
+            throw VDriveCryptoError.missingLocalKey
         }
         do {
             try VDriveCrypto.decryptFile(at: file.url, to: temp, key: SymmetricKey(data: keyData))
         } catch {
-            try FileManager.default.copyItem(at: file.url, to: temp)
+            try? FileManager.default.removeItem(at: temp)
+            throw error
         }
         return temp
     }
@@ -1721,7 +1716,11 @@ struct VDriveHomeView: View {
             let currentFiles = sortedFiles.filter { $0.isLocal }
             var temporaryURLs: [URL] = []
             let urls = try currentFiles.map { current -> URL in
-                if isClearlyPlaintextFile(current.url) { return try previewCompatibleURL(for: current) }
+                if isClearlyPlaintextFile(current.url) {
+                    let temp = try previewCompatibleURL(for: current)
+                    temporaryURLs.append(temp)
+                    return temp
+                }
                 let temp = try decryptedTemporaryURL(for: current)
                 temporaryURLs.append(temp)
                 return temp
