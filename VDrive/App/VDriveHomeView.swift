@@ -195,26 +195,22 @@ private struct VaultThumbnail: View {
             // AVAsset decode only a thumbnail/frame, not the full-resolution media.
             let url = file.url
             let name = file.displayName
-            do {
-                let jpeg = await Task.detached(priority: .utility) { () -> Data? in
-                    if let direct = Self.makeJPEGThumbnail(fromFileURL: url, filename: name) { return direct }
-                    let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                    guard size <= 256 * 1024 * 1024,
-                          let stored = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-                          let keyData = VDriveCrypto.existingLocalKeyData(),
-                          let legacy = try? VDriveCrypto.open(stored, key: SymmetricKey(data: keyData)) else { return nil }
-                    return Self.makeJPEGThumbnail(from: legacy, filename: name)
+            let jpeg = await Task.detached(priority: .utility) { () -> Data? in
+                if let direct = Self.makeJPEGThumbnail(fromFileURL: url, filename: name) { return direct }
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                guard size <= 256 * 1024 * 1024,
+                      let stored = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+                      let keyData = VDriveCrypto.existingLocalKeyData(),
+                      let legacy = try? VDriveCrypto.open(stored, key: SymmetricKey(data: keyData)) else { return nil }
+                return Self.makeJPEGThumbnail(from: legacy, filename: name)
+            }.value
+            if let jpeg {
+                try? await Task.detached(priority: .utility) {
+                    try Self.saveLocalThumbnail(jpeg, for: file.id)
                 }.value
-                if let jpeg {
-                    try? await Task.detached(priority: .utility) {
-                        try Self.saveLocalThumbnail(jpeg, for: file.id)
-                    }.value
-                    image = UIImage(data: jpeg)
-                }
-                loadFailed = image == nil
-            } catch {
-                loadFailed = true
+                image = UIImage(data: jpeg)
             }
+            loadFailed = image == nil
             return
         }
 
@@ -238,20 +234,20 @@ private struct VaultThumbnail: View {
         return UIImage(data: jpeg)
     }
 
-    static func thumbnailDirectory() -> URL {
+    nonisolated static func thumbnailDirectory() -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("VDriveThumbnails", isDirectory: true)
     }
 
-    static func localThumbnailURL(for fileID: String) -> URL {
+    nonisolated static func localThumbnailURL(for fileID: String) -> URL {
         thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".vthumb")
     }
 
-    static func legacyLocalThumbnailURL(for fileID: String) -> URL {
+    nonisolated static func legacyLocalThumbnailURL(for fileID: String) -> URL {
         thumbnailDirectory().appendingPathComponent(fileID.replacingOccurrences(of: "/", with: "_") + ".jpg")
     }
 
-    static func saveLocalThumbnail(_ jpeg: Data, for fileID: String) throws {
+    nonisolated static func saveLocalThumbnail(_ jpeg: Data, for fileID: String) throws {
         let directory = thumbnailDirectory()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var values = URLResourceValues()
@@ -261,7 +257,7 @@ private struct VaultThumbnail: View {
         try jpeg.write(to: localThumbnailURL(for: fileID), options: [.atomic, .completeFileProtection])
     }
 
-    static func saveEncryptedThumbnail(_ encrypted: Data, for fileID: String) throws {
+    nonisolated static func saveEncryptedThumbnail(_ encrypted: Data, for fileID: String) throws {
         let directory = thumbnailDirectory()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var values = URLResourceValues()
@@ -271,12 +267,12 @@ private struct VaultThumbnail: View {
         try encrypted.write(to: localThumbnailURL(for: fileID), options: [.atomic, .completeFileProtection])
     }
 
-    static func removeLocalThumbnail(for fileID: String) {
+    nonisolated static func removeLocalThumbnail(for fileID: String) {
         try? FileManager.default.removeItem(at: localThumbnailURL(for: fileID))
         try? FileManager.default.removeItem(at: legacyLocalThumbnailURL(for: fileID))
     }
 
-    static func makeJPEGThumbnail(from data: Data, filename: String) -> Data? {
+    nonisolated static func makeJPEGThumbnail(from data: Data, filename: String) -> Data? {
         let ext = (filename as NSString).pathExtension.lowercased()
         let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv"]
         let mediaImage: UIImage?
@@ -316,7 +312,7 @@ private struct VaultThumbnail: View {
         }
     }
 
-    static func makeJPEGThumbnail(fromFileURL url: URL, filename: String) -> Data? {
+    nonisolated static func makeJPEGThumbnail(fromFileURL url: URL, filename: String) -> Data? {
         let ext = (filename as NSString).pathExtension.lowercased()
         let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv", "3gp"]
         let mediaImage: UIImage?
@@ -417,17 +413,17 @@ struct VDriveHomeView: View {
                 await migrateLegacyLocalFiles()
                 refreshFiles()
             }
-        .onChange(of: scenePhase) { newPhase in
+        .onChange(of: scenePhase) { _, newPhase in
             handleScenePhaseChange(newPhase)
             if newPhase == .active { flipMotion.start() } else { flipMotion.stop() }
         }
-        .onChange(of: flipMotion.faceDown) { faceDown in
+        .onChange(of: flipMotion.faceDown) { _, faceDown in
             if faceDown { sawFaceDown = true }
             else if sawFaceDown { thumbnailsBlurred.toggle(); sawFaceDown = false }
         }
         .onAppear { flipMotion.start() }
         .onDisappear { flipMotion.stop() }
-        .onChange(of: selection) { items in Task { await importItems(items) } }
+        .onChange(of: selection) { _, items in Task { await importItems(items) } }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .sheet(isPresented: $showingFileImporter) {
             FileImportPicker { result in
@@ -437,7 +433,7 @@ struct VDriveHomeView: View {
                     guard !urls.isEmpty else { message = "Файлы не выбраны."; return }
                     Task { await importFilesFromPicker(urls) }
                 case .failure(let error):
-                    message = "Ошибка выбора файлов: \\(error.localizedDescription)"
+                    message = "Ошибка выбора файлов: \(error.localizedDescription)"
                 }
             }
             .ignoresSafeArea()
@@ -1277,18 +1273,17 @@ struct VDriveHomeView: View {
         var added = 0
         var assetIDs: [String] = []
         var failures: [String] = []
-        do {
-            for (index, item) in items.enumerated() {
+        for (index, item) in items.enumerated() {
                 transferProgress = index
                 transferLabel = "Читаю фото или видео: \(index + 1) из \(items.count)"
                 message = transferLabel
                 do {
                     guard let transferred = try await item.loadTransferable(type: PickerFileTransfer.self) else {
-                        failures.append("Элемент \\(index + 1): iOS не передала файл")
+                        failures.append("Элемент \(index + 1): iOS не передала файл")
                         continue
                     }
                     defer { try? FileManager.default.removeItem(at: transferred.url) }
-                    transferLabel = "Сохраняю на iPhone: \\(index + 1) из \\(items.count)"
+                    transferLabel = "Сохраняю на iPhone: \(index + 1) из \(items.count)"
                     message = transferLabel
                     let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? transferred.url.pathExtension
                     let addedTimestamp = Date().timeIntervalSince1970
@@ -1336,9 +1331,6 @@ struct VDriveHomeView: View {
             } else {
                 finishLocalImportAndSync()
             }
-        } catch {
-            message = "Не удалось начать импорт: \(error.localizedDescription)"
-        }
     }
 
     @MainActor private func finishLocalImportAndSync() {
@@ -1400,9 +1392,8 @@ struct VDriveHomeView: View {
         busy = true
         message = "Импортирую выбранные файлы…"
         defer { busy = false }
-        do {
-            var added = 0
-            var skipped: [String] = []
+        var added = 0
+        var skipped: [String] = []
             for sourceURL in urls {
                 let originalName = sourceURL.lastPathComponent.replacingOccurrences(of: "/", with: "_")
                 let safeName = originalName.isEmpty ? "file.bin" : originalName
@@ -1444,12 +1435,9 @@ struct VDriveHomeView: View {
                     finishLocalImportAndSync()
                 }
             }
-        } catch {
-            message = "Импорт не удался: \(error.localizedDescription)"
-        }
     }
 
-    private func copyImportedFile(from sourceURL: URL, to destination: URL) throws {
+    nonisolated private func copyImportedFile(from sourceURL: URL, to destination: URL) throws {
         let hasAccess = sourceURL.startAccessingSecurityScopedResource()
         defer { if hasAccess { sourceURL.stopAccessingSecurityScopedResource() } }
         var coordinationError: NSError?
@@ -1471,7 +1459,7 @@ struct VDriveHomeView: View {
         if let copyError { throw copyError }
     }
 
-    private func makeEncryptedThumbnail(for localFile: URL) throws -> Data? {
+    nonisolated private func makeEncryptedThumbnail(for localFile: URL) throws -> Data? {
         let rawName = localFile.deletingPathExtension().lastPathComponent
         let mediaName = rawName.components(separatedBy: "__").dropFirst().joined(separator: "__")
         guard let jpeg = VaultThumbnail.makeJPEGThumbnail(fromFileURL: localFile, filename: mediaName) else { return nil }
@@ -1513,13 +1501,18 @@ struct VDriveHomeView: View {
                 ]
                 if ["mov", "mp4", "m4v", "avi", "mkv", "3gp"].contains(ext) {
                     let asset = AVURLAsset(url: fileURL)
-                    let seconds = asset.duration.seconds
-                    if seconds.isFinite && seconds >= 0 {
-                        let total = Int(seconds.rounded())
-                        lines.append(String(format: "Длительность видео: %d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60))
+                    if let duration = try? await asset.load(.duration) {
+                        let seconds = duration.seconds
+                        if seconds.isFinite && seconds >= 0 {
+                            let total = Int(seconds.rounded())
+                            lines.append(String(format: "Длительность видео: %d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60))
+                        }
                     }
-                    if let track = asset.tracks(withMediaType: .video).first {
-                        let size = track.naturalSize.applying(track.preferredTransform)
+                    if let tracks = try? await asset.loadTracks(withMediaType: .video),
+                       let track = tracks.first,
+                       let naturalSize = try? await track.load(.naturalSize),
+                       let preferredTransform = try? await track.load(.preferredTransform) {
+                        let size = naturalSize.applying(preferredTransform)
                         lines.append("Разрешение: \(Int(abs(size.width))) × \(Int(abs(size.height)))")
                     }
                 } else if ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "tiff", "bmp"].contains(ext),
@@ -2101,7 +2094,17 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
     var hasRefreshToken: Bool { readKeychain() != nil }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap { $0.windows }.first { $0.isKeyWindow } ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.windows.first ?? UIWindow()
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let keyWindow = scenes.flatMap({ $0.windows }).first(where: { $0.isKeyWindow }) {
+            return keyWindow
+        }
+        if let firstWindow = scenes.first?.windows.first {
+            return firstWindow
+        }
+        if let scene = scenes.first {
+            return UIWindow(windowScene: scene)
+        }
+        return ASPresentationAnchor()
     }
 
     func connect(clientID: String) async throws {

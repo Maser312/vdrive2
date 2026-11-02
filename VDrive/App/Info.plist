@@ -26,6 +26,8 @@
     <string>VDrive сохраняет выбранные расшифрованные фото и видео в медиатеку только после вашего подтверждения.</string>
     <key>UILaunchScreen</key>
     <dict/>
+    <key>UIRequiresFullScreen</key>
+    <true/>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
