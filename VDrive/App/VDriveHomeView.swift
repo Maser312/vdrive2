@@ -471,12 +471,6 @@ struct VDriveHomeView: View {
         .onAppear { flipMotion.start() }
         .onDisappear { flipMotion.stop() }
         .onChange(of: selection) { _, items in Task { await importItems(items) } }
-        .onChange(of: locked) { _, isLocked in
-            if !isLocked { Task { await autoConnectGoogleIfNeeded() } }
-        }
-        .onChange(of: showingAuthenticator) { _, isShowing in
-            if !isShowing && !locked { Task { await autoConnectGoogleIfNeeded() } }
-        }
         .sheet(isPresented: $showSettings) { settingsSheet }
         .sheet(isPresented: $showingFileImporter) {
             FileImportPicker { result in
@@ -762,9 +756,9 @@ struct VDriveHomeView: View {
                     if pinSetupMode {
                         guard pinEntry.count >= 4 else { message = "PIN должен содержать минимум 4 цифры"; return }
                         UserDefaults.standard.set(pinDigest(pinEntry), forKey: pinKey)
-                        pinEntry = ""; pinSetupMode = false; locked = false; showingAuthenticator = false
+                        pinEntry = ""; pinSetupMode = false; locked = false; showingAuthenticator = false; Task { await autoConnectGoogleIfNeeded() }
                     } else if let saved = UserDefaults.standard.string(forKey: pinKey) {
-                        if saved == pinDigest(pinEntry) { pinEntry = ""; locked = false; showingAuthenticator = false; Task { await refreshCloudInventory() } }
+                        if saved == pinDigest(pinEntry) { pinEntry = ""; locked = false; showingAuthenticator = false; Task { await autoConnectGoogleIfNeeded(); await refreshCloudInventory() } }
                         else { message = "Неверный PIN-код" }
                     } else {
                         pinSetupMode = true
@@ -2234,7 +2228,7 @@ struct VDriveHomeView: View {
         }
         context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Разблокировать VDrive") { success, authError in
             DispatchQueue.main.async {
-                if success { locked = false; showingAuthenticator = false; pinEntry = ""; Task { await refreshCloudInventory() } }
+                if success { locked = false; showingAuthenticator = false; pinEntry = ""; Task { await autoConnectGoogleIfNeeded(); await refreshCloudInventory() } }
                 else { message = authError?.localizedDescription ?? "Не удалось разблокировать" }
             }
         }
