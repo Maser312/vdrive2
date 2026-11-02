@@ -1509,10 +1509,11 @@ struct VDriveHomeView: View {
         guard file.isLocal else {
             let ext = (file.displayName as NSString).pathExtension
             let type = UTType(filenameExtension: ext)?.localizedDescription ?? "Неизвестный тип"
-            let added = file.addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: file.addedDate, dateStyle: .medium, timeStyle: .short)
+            let added = file.addedDate == .distantPast ? "Неизвестно" : DateFormatter.localizedString(from: file.addedDate, dateStyle: .medium, timeStyle: .medium)
+            let captured = file.captureDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "Будет прочитана из метаданных после скачивания"
             fileProperties = FileProperties(
                 title: file.displayName,
-                details: "Имя: \(file.displayName)\nТип: \(type)\nРасположение: Google Drive\nДата добавления: \(added)\nРазмер и длительность: доступны после скачивания файла на устройство."
+                details: "Имя: \(file.displayName)\nТип: \(type)\nРасположение: Google Drive\nДата добавления: \(added)\nДата съёмки / создания: \(captured)\nРазмер и длительность: доступны после скачивания файла на устройство."
             )
             return
         }
