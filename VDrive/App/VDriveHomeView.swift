@@ -14,6 +14,48 @@ import QuickLook
 import CryptoKit
 import Security
 
+
+/// Диагностический журнал VDrive. Содержимое файлов, OAuth-токены и ключи сюда не записываются.
+private final class VDriveDiagnosticLog {
+    static let shared = VDriveDiagnosticLog()
+    private let queue = DispatchQueue(label: "app.vdrive.diagnostics", qos: .utility)
+    private let enabledKey = "vdrive.diagnostics.enabled"
+    private let filename = "VDrive-Diagnostics.log"
+    private init() {}
+    var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+    func setEnabled(_ value: Bool) {
+        UserDefaults.standard.set(value, forKey: enabledKey)
+        write("LOG", value ? "Журнал включён" : "Журнал выключен")
+    }
+    private var logURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent(filename)
+    }
+    func write(_ category: String, _ message: String) {
+        guard isEnabled else { return }
+        let line = "\(ISO8601DateFormatter().string(from: Date())) [\(category)] \(message)\n"
+        queue.async {
+            do {
+                try FileManager.default.createDirectory(at: self.logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let data = Data(line.utf8)
+                if FileManager.default.fileExists(atPath: self.logURL.path) {
+                    let handle = try FileHandle(forWritingTo: self.logURL)
+                    try handle.seekToEnd(); try handle.write(contentsOf: data); try handle.close()
+                } else { try data.write(to: self.logURL, options: .completeFileProtection) }
+            } catch { }
+        }
+    }
+    func export() throws -> URL {
+        queue.sync {}
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            try Data("Журнал пока пуст. Включите запись и повторите проблемное действие.".utf8).write(to: logURL, options: .atomic)
+        }
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("VDrive-Diagnostics-\(Int(Date().timeIntervalSince1970)).log")
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.copyItem(at: logURL, to: destination)
+        return destination
+    }
+}
+
 private struct PickerFileTransfer: Transferable {
     let url: URL
 
@@ -399,6 +441,7 @@ struct VDriveHomeView: View {
     @State private var showCloudRecoveryPrompt = false
     @State private var showPINAlert = false
     @State private var isConnected = GoogleDriveStore.shared.hasRefreshToken
+    @State private var diagnosticLoggingEnabled = UserDefaults.standard.bool(forKey: "vdrive.diagnostics.enabled")
     @State private var cloudVaultUnlocked = false
     @State private var showGoogleSetupInfo = false
     @State private var fileProperties: FileProperties?
@@ -1176,6 +1219,16 @@ struct VDriveHomeView: View {
                     Text("На телефоне оригиналы и миниатюры хранятся открытыми для быстрого просмотра; в Google Drive они шифруются.").font(.footnote).foregroundStyle(.secondary)
                     Button("Обновить статистику") { refreshFiles(); Task { await refreshCloudInventory() } }
                 }
+                Section("Журнал диагностики") {
+                    Toggle("Вести подробный журнал", isOn: $diagnosticLoggingEnabled)
+                        .onChange(of: diagnosticLoggingEnabled) { _, enabled in VDriveDiagnosticLog.shared.setEnabled(enabled) }
+                    Button("Выгрузить журнал", systemImage: "square.and.arrow.up") {
+                        do { let url = try VDriveDiagnosticLog.shared.export(); shareURL = url; exportToFiles = false; showingShareSheet = true }
+                        catch { message = "Не удалось подготовить журнал: \\(error.localizedDescription)" }
+                    }
+                    Text("Записываются этапы операций, время, размеры файлов, сетевые статусы и ошибки. Пароли, токены, ключ шифрования и содержимое файлов не записываются.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("Google Drive") {
                     LabeledContent("Статус", value: isConnected ? "Подключён" : "Не подключён")
                     Button("Настроить OAuth Client ID") { showClientID = true }
@@ -1932,7 +1985,7 @@ struct VDriveHomeView: View {
         } catch { message = "Ошибка Google Drive: \(error.localizedDescription)" }
     }
 
-    @MainActor private func downloadMissing() async {
+    @MainActor private func downloadMissing() async {\n        VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
         busy = true
@@ -1947,7 +2000,7 @@ struct VDriveHomeView: View {
         }
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey())\n            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\\(count)")
             transferProgress = count
             transferTotal = max(count, 1)
             transferLabel = "Загрузка из Google Drive завершена"
@@ -2180,7 +2233,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             URLQueryItem(name: "prompt", value: "consent")
         ]
         guard let authURL = components.url else { throw DriveError.invalidResponse }
-        let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+        VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \\(hasRefreshToken)")\n        let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: scheme) { url, error in
                 if let error { continuation.resume(throwing: error); return }
                 guard let url else { continuation.resume(throwing: DriveError.invalidResponse); return }
@@ -2606,7 +2659,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DriveError.server(String(data: data, encoding: .utf8) ?? "Token refresh error")
         }
-        accessToken = try JSONDecoder().decode(TokenResponse.self, from: data).access_token
+        accessToken = try JSONDecoder().decode(TokenResponse.self, from: data).access_token\n        VDriveDiagnosticLog.shared.write("AUTH", "Access token обновлён; HTTP \\(http.statusCode)")
     }
 
     private func readKeychain() -> String? {
