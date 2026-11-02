@@ -382,7 +382,7 @@ private struct VaultThumbnail: View {
         guard let mediaImage, mediaImage.size.width > 0, mediaImage.size.height > 0 else { return nil }
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 320, height: 320))
         return renderer.jpegData(withCompressionQuality: 0.58) { _ in
-            let scale = min(320 / mediaImage.size.width, 320 / mediaImage.size.height)
+            let scale = max(320 / mediaImage.size.width, 320 / mediaImage.size.height)
             let size = CGSize(width: mediaImage.size.width * scale, height: mediaImage.size.height * scale)
             mediaImage.draw(in: CGRect(x: (320 - size.width) / 2, y: (320 - size.height) / 2, width: size.width, height: size.height))
         }
