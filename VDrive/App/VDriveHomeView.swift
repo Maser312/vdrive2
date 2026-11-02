@@ -2294,12 +2294,12 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
         session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue())
     }
 
-    func download(_ request: URLRequest) async throws -> (URL, URLResponse) {
+    func download(_ request: URLRequest, expectedBytes: Int64 = 0) async throws -> (URL, URLResponse) {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("vdrive-download-\(UUID().uuidString).part")
         FileManager.default.createFile(atPath: url.path, contents: nil)
         outputHandle = try FileHandle(forWritingTo: url)
         do {
-            let (_, response) = try await perform(request, uploadFile: nil)
+            let (_, response) = try await perform(request, uploadFile: nil, expectedDownloadBytes: expectedBytes)
             try outputHandle?.close()
             outputHandle = nil
             return (url, response)
@@ -2315,12 +2315,12 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
         try await perform(request, uploadFile: file)
     }
 
-    private func perform(_ request: URLRequest, uploadFile: URL?) async throws -> (Data, URLResponse) {
+    private func perform(_ request: URLRequest, uploadFile: URL?, expectedDownloadBytes: Int64 = 0) async throws -> (Data, URLResponse) {
         try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             responseData = Data()
             receivedDownloadBytes = 0
-            expectedDownloadBytes = 0
+            self.expectedDownloadBytes = expectedDownloadBytes
             lastBytes = 0
             lastDate = Date()
             lastReport = .distantPast
@@ -2345,7 +2345,7 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         if outputHandle != nil {
-            expectedDownloadBytes = response.expectedContentLength
+            if response.expectedContentLength > 0 { expectedDownloadBytes = response.expectedContentLength }
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 completionHandler(.cancel)
                 return
@@ -2679,19 +2679,41 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
 
     func uploadAuxiliary(_ data: Data, name: String) async throws {
         try await ensureAccessToken()
-        let boundary = "vdrive-sidecar-" + UUID().uuidString
-        let metadata: [String: Any] = ["name": name, "mimeType": "application/octet-stream"]
-        var body = Data()
-        body.append(("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n").data(using: .utf8)!)
-        body.append(try JSONSerialization.data(withJSONObject: metadata))
-        body.append(("\r\n--" + boundary + "\r\nContent-Type: application/octet-stream\r\n\r\n").data(using: .utf8)!)
-        body.append(data)
-        body.append(("\r\n--" + boundary + "--\r\n").data(using: .utf8)!)
-        var request = URLRequest(url: URL(string: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name")!)
-        request.httpMethod = "POST"
+        var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+        components.queryItems = [
+            URLQueryItem(name: "pageSize", value: "1"),
+            URLQueryItem(name: "q", value: "name = '\(name)' and trashed = false"),
+            URLQueryItem(name: "fields", value: "files(id,name)")
+        ]
+        var lookup = URLRequest(url: components.url!)
+        lookup.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
+        let (lookupData, lookupResponse) = try await URLSession.shared.data(for: lookup)
+        guard let lookupHTTP = lookupResponse as? HTTPURLResponse, (200..<300).contains(lookupHTTP.statusCode) else {
+            throw DriveError.server(String(data: lookupData, encoding: .utf8) ?? "Не удалось найти старую миниатюру")
+        }
+        let existing = try JSONDecoder().decode(DriveFileList.self, from: lookupData).files.first
+        var request: URLRequest
+        if let existing {
+            // Replace media content in-place; repeated syncs must not create duplicate thumbnails.
+            request = URLRequest(url: URL(string: "https://www.googleapis.com/upload/drive/v3/files/\(existing.id)?uploadType=media")!)
+            request.httpMethod = "PATCH"
+            request.httpBody = data
+            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        } else {
+            let boundary = "vdrive-sidecar-" + UUID().uuidString
+            let metadata: [String: Any] = ["name": name, "mimeType": "application/octet-stream"]
+            var body = Data()
+            body.append(("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n").data(using: .utf8)!)
+            body.append(try JSONSerialization.data(withJSONObject: metadata))
+            body.append(("\r\n--" + boundary + "\r\nContent-Type: application/octet-stream\r\n\r\n").data(using: .utf8)!)
+            body.append(data)
+            body.append(("\r\n--" + boundary + "--\r\n").data(using: .utf8)!)
+            request = URLRequest(url: URL(string: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name")!)
+            request.httpMethod = "POST"
+            request.setValue("multipart/related; boundary=" + boundary, forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+        }
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
-        request.setValue("multipart/related; boundary=" + boundary, forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
         let (responseData, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DriveError.server(String(data: responseData, encoding: .utf8) ?? "Thumbnail upload error")
@@ -2756,7 +2778,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
         let transfer = VDriveTransferSession(progress: progress)
-        let (downloadedURL, response) = try await transfer.download(request)
+        let (downloadedURL, response) = try await transfer.download(request, expectedBytes: remoteSize)
         let downloadedBytes = (try? downloadedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         VDriveDiagnosticLog.shared.write("DOWNLOAD", "Ответ Drive; HTTP=\(status); bytes=\(downloadedBytes); seconds=\(String(format: "%.2f", Date().timeIntervalSince(started)))")
