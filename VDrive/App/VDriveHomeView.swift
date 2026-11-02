@@ -2116,11 +2116,13 @@ struct VDriveHomeView: View {
         transferSpeedBytesPerSecond = 0
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey()) { received, total, speed in
+            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey(), progress: { received, total, speed in
                 self.transferBytes = received
                 self.transferExpectedBytes = total
                 self.transferSpeedBytesPerSecond = speed
-            }
+            }, phase: { stage in
+                self.transferLabel = stage
+            })
             VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
             transferProgress = count
             transferTotal = max(count, 1)
@@ -2888,7 +2890,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return data
     }
 
-    func downloadMissing(to directory: URL, localNames: Set<String>, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws -> Int {
+    func downloadMissing(to directory: URL, localNames: Set<String>, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }, phase: @escaping (String) -> Void = { _ in }) async throws -> Int {
         try await ensureAccessToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
         components.queryItems = [
@@ -2917,7 +2919,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             let destination = directory.appendingPathComponent(item.name)
             guard !FileManager.default.fileExists(atPath: destination.path) else { existingNames.insert(item.name); continue }
             VDriveDiagnosticLog.shared.write("SYNC", "Очередь: \(item.name); cloudBytes=\(item.size ?? "unknown")")
-            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: progress)
+            phase("Файл \(count + 1) из \(pending.count): \(item.name)")
+            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: progress, phase: phase)
             existingNames.insert(item.name)
             count += 1
             VDriveDiagnosticLog.shared.write("SYNC", "Завершён файл \(item.name); \(count)/\(pending.count)")
