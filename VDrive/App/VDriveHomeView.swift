@@ -2104,7 +2104,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         if let scene = scenes.first {
             return UIWindow(windowScene: scene)
         }
-        return ASPresentationAnchor()
+        fatalError("No active UIWindowScene available")
     }
 
     func connect(clientID: String) async throws {
