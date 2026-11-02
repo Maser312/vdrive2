@@ -2234,6 +2234,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             URLQueryItem(name: "access_type", value: "offline"),
             URLQueryItem(name: "include_granted_scopes", value: "true")
         ]
+        if !hasRefreshToken { components.queryItems?.append(URLQueryItem(name: "prompt", value: "consent")) }
         guard let authURL = components.url else { throw DriveError.invalidResponse }
         VDriveDiagnosticLog.shared.write("AUTH", "Запуск OAuth; refresh token уже есть: \(hasRefreshToken)")
         let callback = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
