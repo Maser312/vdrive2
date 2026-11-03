@@ -1046,7 +1046,7 @@ struct VDriveHomeView: View {
                                         } else {
                                             Button("Скачать на устройство", systemImage: "icloud.and.arrow.down") { Task { await downloadFile(file) } }
                                                 .disabled(!isConnected || !cloudVaultUnlocked || busy)
-                                            Button("Удалить из Google Drive", systemImage: "icloud", role: .destructive) { Task { await deleteCloud(file) } }
+                                            Button("Удалить из Google Drive", systemImage: "icloud", role: .destructive) { requestDelete(file, mode: "cloud") }
                                         }
                                     }
                                 }
@@ -1182,7 +1182,7 @@ struct VDriveHomeView: View {
                 Button("Удалить", role: .destructive) { Task { await bulkDeleteSelected() } }
                 Button("Отмена", role: .cancel) {}
             } message: {
-                Text("Будет удалено: \\(selectedFileIDs.count) файлов. " + (bulkDeleteMode == "local" ? "Только копии на этом устройстве." : bulkDeleteMode == "cloud" ? "Только копии из Google Drive." : "Копии и на устройстве, и в Google Drive. Это действие нельзя отменить."))
+                Text("Будет удалено: \(selectedFileIDs.count) файлов. " + (bulkDeleteMode == "local" ? "Только копии на этом устройстве." : bulkDeleteMode == "cloud" ? "Только копии из Google Drive." : "Копии и на устройстве, и в Google Drive. Это действие нельзя отменить."))
             }
             .confirmationDialog("Подтвердить удаление?", isPresented: $showSingleDeleteConfirmation, titleVisibility: .visible) {
                 Button("Удалить", role: .destructive) {
@@ -2008,11 +2008,11 @@ struct VDriveHomeView: View {
         guard let file = pendingDeleteFile else { return "Файл не будет удалён." }
         switch pendingDeleteMode {
         case "local":
-            return "«\\(file.displayName)» будет удалён только с этого устройства. Облачная копия останется, если она есть."
+            return "«\(file.displayName)» будет удалён только с этого устройства. Облачная копия останется, если она есть."
         case "cloud":
-            return "«\\(file.displayName)» и его облачные миниатюры будут удалены из Google Drive. Локальная копия останется, если она есть."
+            return "«\(file.displayName)» и его облачные миниатюры будут удалены из Google Drive. Локальная копия останется, если она есть."
         default:
-            return "«\\(file.displayName)» будет удалён и с устройства, и из Google Drive вместе с облачными миниатюрами. Восстановить его через VDrive будет нельзя."
+            return "«\(file.displayName)» будет удалён и с устройства, и из Google Drive вместе с облачными миниатюрами. Восстановить его через VDrive будет нельзя."
         }
     }
 
