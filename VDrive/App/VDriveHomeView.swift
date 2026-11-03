@@ -1222,9 +1222,9 @@ struct VDriveHomeView: View {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         let ids = selectedFiles.filter { !$0.isLocal }.compactMap { file -> UUID? in
             guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return nil }
-            return transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, progress, phase in
+            return transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, callbacks in
                 try Task.checkCancellation()
-                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: callbacks.progress, phase: callbacks.phase)
             }
         }
         for id in ids { await transferCenter.wait(id) }
@@ -1960,9 +1960,9 @@ struct VDriveHomeView: View {
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище секретным ключом."; return }
         guard file.isLocal else { return }
-        let id = transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+        let id = transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, callbacks in
             try Task.checkCancellation()
-            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: callbacks.progress, phase: callbacks.phase)
             try Task.checkCancellation()
             callbacks.phase("Подготовка миниатюры")
             let thumb = try await Task.detached(priority: .utility) { try await self.makeEncryptedThumbnail(for: file.url) }.value
@@ -1974,9 +1974,9 @@ struct VDriveHomeView: View {
     @MainActor private func downloadFile(_ file: VaultFile) async {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         guard !file.isLocal, let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return }
-        let id = transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, progress, phase in
+        let id = transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, callbacks in
             try Task.checkCancellation()
-            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: callbacks.progress, phase: callbacks.phase)
         }
         await transferCenter.wait(id); refreshFiles()
     }
@@ -2028,10 +2028,10 @@ struct VDriveHomeView: View {
         let localFiles = files.filter { $0.isLocal }
         let pendingCount = localFiles.filter { !$0.uploaded }.count
         let ids = localFiles.map { file in
-            transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+            transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, callbacks in
                 try Task.checkCancellation()
                 if !file.uploaded {
-                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: callbacks.progress, phase: callbacks.phase)
                 }
                 try Task.checkCancellation()
                 callbacks.phase("Создание квадратной миниатюры")
@@ -3132,7 +3132,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             guard !FileManager.default.fileExists(atPath: destination.path) else { existingNames.insert(item.name); continue }
             VDriveDiagnosticLog.shared.write("SYNC", "Очередь: \(item.name); cloudBytes=\(item.size ?? "unknown")")
             phase("Файл \(count + 1) из \(pending.count): \(item.name)")
-            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: progress, phase: phase)
+            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: callbacks.progress, phase: callbacks.phase)
             existingNames.insert(item.name)
             count += 1
             VDriveDiagnosticLog.shared.write("SYNC", "Завершён файл \(item.name); \(count)/\(pending.count)")
