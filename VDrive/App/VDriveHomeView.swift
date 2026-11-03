@@ -1206,9 +1206,9 @@ struct VDriveHomeView: View {
     @MainActor private func bulkUploadSelected() async {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         let ids = selectedFiles.filter { $0.isLocal && !$0.uploaded }.map { file in
-            transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+            transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, callbacks in
                 try Task.checkCancellation()
-                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: callbacks.progress, phase: callbacks.phase)
                 try Task.checkCancellation()
                 if let thumb = try await self.makeEncryptedThumbnail(for: file.url) { try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2") }
             }
@@ -1964,7 +1964,7 @@ struct VDriveHomeView: View {
             try Task.checkCancellation()
             try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
             try Task.checkCancellation()
-            phase("Подготовка миниатюры")
+            callbacks.phase("Подготовка миниатюры")
             let thumb = try await Task.detached(priority: .utility) { try await self.makeEncryptedThumbnail(for: file.url) }.value
             if let thumb { try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2") }
         }
@@ -2034,10 +2034,10 @@ struct VDriveHomeView: View {
                     try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
                 }
                 try Task.checkCancellation()
-                phase("Создание квадратной миниатюры")
+                callbacks.phase("Создание квадратной миниатюры")
                 let thumb = try await Task.detached(priority: .utility) { try await self.makeEncryptedThumbnail(for: file.url) }.value
                 if let thumb {
-                    phase("Выгрузка миниатюры")
+                    callbacks.phase("Выгрузка миниатюры")
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
             }
@@ -2416,7 +2416,8 @@ private struct VDriveTempItem: Identifiable {
 }
 private typealias VDriveTransferProgress = (Int64, Int64, Double) -> Void
 private typealias VDriveTransferPhase = (String) -> Void
-private typealias VDriveTransferWork = (UUID, VDriveTransferProgress, VDriveTransferPhase) async throws -> Void
+private struct VDriveTransferCallbacks { let progress: VDriveTransferProgress; let phase: VDriveTransferPhase }
+private typealias VDriveTransferWork = (UUID, VDriveTransferCallbacks) async throws -> Void
 @MainActor private final class VDriveTransferCenter: ObservableObject {
     static let shared = VDriveTransferCenter()
     @Published private(set) var items: [VDriveTransferItem] = []
@@ -2523,8 +2524,11 @@ private typealias VDriveTransferWork = (UUID, VDriveTransferProgress, VDriveTran
     private func execute(_ job: Job) async {
         if let i = items.firstIndex(where: { $0.id == job.id }) { items[i].status = .running; items[i].phase = "Подготовка" }; persist()
         do {
-            try await job.work(job.id, { [weak self] b,t,s in Task { @MainActor in self?.update(job.id, bytes:b, total:t, speed:s) } },
-                               { [weak self] p in Task { @MainActor in self?.update(job.id, phase:p) } })
+            let callbacks = VDriveTransferCallbacks(
+                progress: { [weak self] b,t,s in Task { @MainActor in self?.update(job.id, bytes:b, total:t, speed:s) } },
+                phase: { [weak self] p in Task { @MainActor in self?.update(job.id, phase:p) } }
+            )
+            try await job.work(job.id, callbacks)
             finish(job.id, .completed, nil)
         } catch is CancellationError { finish(job.id, .cancelled, nil) }
         catch { finish(job.id, .failed, error.localizedDescription) }
