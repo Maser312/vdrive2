@@ -1207,6 +1207,7 @@ struct VDriveHomeView: View {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         let ids = selectedFiles.filter { $0.isLocal && !$0.uploaded }.map { file in
             transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+                try Task.checkCancellation()
                 try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
                 try Task.checkCancellation()
                 if let thumb = try await self.makeEncryptedThumbnail(for: file.url) { try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2") }
@@ -1222,6 +1223,7 @@ struct VDriveHomeView: View {
         let ids = selectedFiles.filter { !$0.isLocal }.compactMap { file -> UUID? in
             guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return nil }
             return transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, progress, phase in
+                try Task.checkCancellation()
                 try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
             }
         }
@@ -1959,6 +1961,7 @@ struct VDriveHomeView: View {
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище секретным ключом."; return }
         guard file.isLocal else { return }
         let id = transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+            try Task.checkCancellation()
             try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
             try Task.checkCancellation()
             phase("Подготовка миниатюры")
@@ -1972,6 +1975,7 @@ struct VDriveHomeView: View {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         guard !file.isLocal, let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return }
         let id = transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, progress, phase in
+            try Task.checkCancellation()
             try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
         }
         await transferCenter.wait(id); refreshFiles()
@@ -2025,6 +2029,7 @@ struct VDriveHomeView: View {
         let pendingCount = localFiles.filter { !$0.uploaded }.count
         let ids = localFiles.map { file in
             transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+                try Task.checkCancellation()
                 if !file.uploaded {
                     try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
                 }
@@ -2508,7 +2513,10 @@ private typealias VDriveTransferWork = (UUID, VDriveTransferProgress, VDriveTran
             let job = queue.remove(at: p)
             guard let item = items.first(where: { $0.id == job.id }) else { continue }
             takeSlot(job.id, item.direction)
-            tasks[job.id] = Task { @MainActor [weak self] in await self?.execute(job) }
+            tasks[job.id] = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.execute(job)
+            }
         }
         persist()
     }
