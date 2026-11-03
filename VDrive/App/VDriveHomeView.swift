@@ -2021,56 +2021,26 @@ struct VDriveHomeView: View {
     @MainActor private func syncAll() async {
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
-        // Refresh thumbnails for every local original, including files already uploaded.
-        // This replaces stale aspect-fit previews in both the local cache and Drive.
         let localFiles = files.filter { $0.isLocal }
-        let pending = localFiles.filter { !$0.uploaded }
-        busy = true
-        transferProgress = 0
-        transferTotal = max(localFiles.count, 1)
-        transferBytes = 0
-        transferExpectedBytes = 0
-        transferSpeedBytesPerSecond = 0
-        transferLabel = "Подготовка выгрузки в Google Drive"
-        defer {
-            busy = false
-            transferLabel = ""
-            transferProgress = 0
-            transferTotal = 0
-            transferBytes = 0
-            transferExpectedBytes = 0
-            transferSpeedBytesPerSecond = 0
-        }
-        do {
-            for (index, file) in localFiles.enumerated() {
+        let pendingCount = localFiles.filter { !$0.uploaded }.count
+        let ids = localFiles.map { file in
+            transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
                 if !file.uploaded {
-                    transferLabel = "Выгружаю медиа: \(index + 1) из \(localFiles.count)"
-                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), progress: { sent, total, speed in
-                        self.transferBytes = sent
-                        self.transferExpectedBytes = total
-                        self.transferSpeedBytesPerSecond = speed
-                    }, phase: { stage in
-                        self.transferLabel = stage
-                    })
+                    try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
                 }
-                transferLabel = "Создаю квадратную миниатюру: \(index + 1) из \(localFiles.count)"
-                let thumb = try await Task.detached(priority: .utility) {
-                    try await self.makeEncryptedThumbnail(for: file.url)
-                }.value
+                try Task.checkCancellation()
+                phase("Создание квадратной миниатюры")
+                let thumb = try await Task.detached(priority: .utility) { try await self.makeEncryptedThumbnail(for: file.url) }.value
                 if let thumb {
-                    transferLabel = "Передаю миниатюру: \(index + 1) из \(localFiles.count)"
+                    phase("Выгрузка миниатюры")
                     try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
                 }
-                transferProgress = index + 1
-                transferBytes = 0
-                transferExpectedBytes = 0
-                transferSpeedBytesPerSecond = 0
             }
-            refreshFiles()
-            message = localFiles.isEmpty
-                ? "Все файлы уже синхронизированы."
-                : "Синхронизация завершена: обновлено миниатюр — \(localFiles.count), новых файлов — \(pending.count)."
-        } catch { message = "Ошибка Google Drive: \(error.localizedDescription)" }
+        }
+        for id in ids { await transferCenter.wait(id) }
+        await refreshCloudInventory()
+        refreshFiles()
+        message = "Синхронизация завершена: обновлено миниатюр — \(localFiles.count), новых файлов — \(pendingCount)."
     }
 
     @MainActor private func downloadMissing() async {
@@ -2439,13 +2409,16 @@ private struct VDriveTransferItem: Identifiable, Codable {
 private struct VDriveTempItem: Identifiable {
     let id: String; let url: URL; let bytes: Int64; let date: Date
 }
+private typealias VDriveTransferProgress = (Int64, Int64, Double) -> Void
+private typealias VDriveTransferPhase = (String) -> Void
+private typealias VDriveTransferWork = (UUID, VDriveTransferProgress, VDriveTransferPhase) async throws -> Void
 @MainActor private final class VDriveTransferCenter: ObservableObject {
     static let shared = VDriveTransferCenter()
     @Published private(set) var items: [VDriveTransferItem] = []
     @Published private(set) var temporary: [VDriveTempItem] = []
     private struct Job {
         let id: UUID
-        let work: (UUID, @escaping (Int64, Int64, Double) -> Void, @escaping (String) -> Void) async throws -> Void
+        let work: VDriveTransferWork
     }
     private var queue: [Job] = []
     private var jobs: [UUID: Job] = [:]
@@ -2463,7 +2436,7 @@ private struct VDriveTempItem: Identifiable {
         scanTemporary()
     }
     @discardableResult func enqueue(direction: VDriveTransferDirection, name: String, size: Int64 = 0,
-        work: @escaping (UUID, @escaping (Int64, Int64, Double) -> Void, @escaping (String) -> Void) async throws -> Void) -> UUID {
+        work: @escaping VDriveTransferWork) -> UUID {
         let id = UUID()
         items.insert(VDriveTransferItem(id: id, direction: direction, fileName: name, status: .queued, phase: "Ожидает запуска", bytes: 0, total: size, speed: 0, error: nil, created: Date()), at: 0)
         let job = Job(id: id, work: work); jobs[id] = job; queue.append(job); persist(); pump(); return id
