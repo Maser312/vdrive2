@@ -501,6 +501,8 @@ struct VDriveHomeView: View {
     @State private var pinEntry = ""
     @State private var pinSetupMode = false
     @State private var showSettings = false
+    @State private var showControlCenter = false
+    @StateObject private var transferCenter = VDriveTransferCenter.shared
     @State private var clientIDInput = UserDefaults.standard.string(forKey: "googleClientID") ?? "15564278108-3npmd22j8obehjl19rpbpeeldlg2bn3k.apps.googleusercontent.com"
     @State private var showClientID = false
     @State private var selectedFile: VaultFile?
@@ -590,6 +592,7 @@ struct VDriveHomeView: View {
         }
         .onChange(of: selection) { _, items in Task { await importItems(items) } }
         .sheet(isPresented: $showSettings) { settingsSheet }
+        .sheet(isPresented: $showControlCenter) { VDriveControlCenterView(center: transferCenter) }
         .sheet(isPresented: $showingFileImporter) {
             FileImportPicker { result in
                 showingFileImporter = false
@@ -1031,7 +1034,7 @@ struct VDriveHomeView: View {
                                         }
                                         if file.isLocal && !file.uploaded {
                                             Button("Выгрузить в Google Drive", systemImage: "icloud.and.arrow.up") { Task { await uploadFile(file) } }
-                                                .disabled(!isConnected || !cloudVaultUnlocked || busy)
+                                                .disabled(!isConnected || !cloudVaultUnlocked)
                                             Button("Удалить с устройства", systemImage: "trash", role: .destructive) { deleteLocal(file) }
                                         } else if file.isLocal && file.uploaded {
                                             Button("Удалить с устройства", systemImage: "iphone", role: .destructive) { deleteLocal(file) }
@@ -1074,6 +1077,8 @@ struct VDriveHomeView: View {
                             .accessibilityLabel("Добавить фото или видео")
                             Button { showingFileImporter = true } label: { metalIconButton(icon: "folder.badge.plus") }
                                 .buttonStyle(.plain).disabled(busy).accessibilityLabel("Добавить любые файлы из приложения Файлы")
+                            Button { showControlCenter = true } label: { Image(systemName: "arrow.left.arrow.right.circle.fill").font(.system(size: 20, weight: .semibold)) }
+                                .buttonStyle(.plain).accessibilityLabel("Открыть центр управления передачами")
                             Image(systemName: isConnected ? "checkmark.icloud.fill" : "icloud.slash")
                                 .font(.system(size: 19, weight: .semibold))
                                 .foregroundStyle(isConnected ? .green : .secondary)
@@ -1116,7 +1121,6 @@ struct VDriveHomeView: View {
                                             }
                                         }
                                     } label: { metalIconButton(icon: "ellipsis.circle") }
-                                    .disabled(busy)
                                     .accessibilityLabel("Действия с выбранными файлами")
                                 }
                                 Button("Готово") {
@@ -1144,6 +1148,7 @@ struct VDriveHomeView: View {
                                             }
                                         }
                                     }
+                                    Button("Control Center", systemImage: "arrow.left.arrow.right") { showControlCenter = true }
                                     Button("Настройки", systemImage: "gearshape") { showSettings = true }
                                     Button("Заблокировать хранилище", systemImage: "lock.fill") {
                                         locked = true
@@ -1200,86 +1205,29 @@ struct VDriveHomeView: View {
 
     @MainActor private func bulkUploadSelected() async {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
-        let targets = selectedFiles.filter { $0.isLocal && !$0.uploaded }
-        busy = true
-        transferProgress = 0
-        transferTotal = targets.count
-        transferBytes = 0
-        transferExpectedBytes = 0
-        transferSpeedBytesPerSecond = 0
-        transferLabel = "Выгружаю выбранные файлы…"
-        defer {
-            busy = false
-            transferLabel = ""
-            transferProgress = 0
-            transferTotal = 0
-            transferBytes = 0
-            transferExpectedBytes = 0
-            transferSpeedBytesPerSecond = 0
-            refreshFiles()
-        }
-        do {
-            for (index, file) in targets.enumerated() {
-                transferLabel = "Выгружаю файл \(index + 1) из \(targets.count)"
-                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), progress: { sent, total, speed in
-                    self.transferBytes = sent
-                    self.transferExpectedBytes = total
-                    self.transferSpeedBytesPerSecond = speed
-                }, phase: { stage in
-                    self.transferLabel = stage
-                })
-                if let thumb = try await self.makeEncryptedThumbnail(for: file.url) {
-                    try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
-                }
-                transferProgress = index + 1
-                transferBytes = 0
-                transferExpectedBytes = 0
-                transferSpeedBytesPerSecond = 0
+        let ids = selectedFiles.filter { $0.isLocal && !$0.uploaded }.map { file in
+            transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+                try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+                try Task.checkCancellation()
+                if let thumb = try await self.makeEncryptedThumbnail(for: file.url) { try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2") }
             }
-            await refreshCloudInventory()
-            message = "Выбранные файлы выгружены."
-        } catch { message = "Ошибка массовой выгрузки: \(error.localizedDescription)" }
+        }
+        for id in ids { await transferCenter.wait(id) }
+        await refreshCloudInventory(); refreshFiles()
+        message = "Пакетная выгрузка завершена. Подробности — в Control Center."
     }
 
     @MainActor private func bulkDownloadSelected() async {
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
-        let targets = selectedFiles.filter { !$0.isLocal }
-        busy = true
-        transferProgress = 0
-        transferTotal = targets.count
-        transferBytes = 0
-        transferExpectedBytes = 0
-        transferSpeedBytesPerSecond = 0
-        transferLabel = "Скачиваю выбранные файлы…"
-        defer {
-            busy = false
-            transferLabel = ""
-            transferProgress = 0
-            transferTotal = 0
-            transferBytes = 0
-            transferExpectedBytes = 0
-            transferSpeedBytesPerSecond = 0
-            refreshFiles()
-        }
-        do {
-            for (index, file) in targets.enumerated() {
-                guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { continue }
-                transferLabel = "Скачиваю файл \(index + 1) из \(targets.count)"
-                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), progress: { received, total, speed in
-                    self.transferBytes = received
-                    self.transferExpectedBytes = total
-                    self.transferSpeedBytesPerSecond = speed
-                }, phase: { stage in
-                    self.transferLabel = stage
-                })
-                transferProgress = index + 1
-                transferBytes = 0
-                transferExpectedBytes = 0
-                transferSpeedBytesPerSecond = 0
+        let ids = selectedFiles.filter { !$0.isLocal }.compactMap { file -> UUID? in
+            guard let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return nil }
+            return transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, progress, phase in
+                try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
             }
-            await refreshCloudInventory()
-            message = "Выбранные файлы скачаны."
-        } catch { message = "Ошибка массового скачивания: \(error.localizedDescription)" }
+        }
+        for id in ids { await transferCenter.wait(id) }
+        await refreshCloudInventory(); refreshFiles()
+        message = "Пакетное скачивание завершено. Подробности — в Control Center."
     }
 
     @MainActor private func bulkDeleteSelected() async {
@@ -2009,80 +1957,24 @@ struct VDriveHomeView: View {
     @MainActor private func uploadFile(_ file: VaultFile) async {
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище секретным ключом."; return }
-        guard file.isLocal else { message = "Файл уже находится только в облаке."; return }
-        busy = true
-        transferProgress = 0
-        transferTotal = 2
-        transferBytes = 0
-        transferExpectedBytes = 0
-        transferSpeedBytesPerSecond = 0
-        transferLabel = "Шифрую и выгружаю в Google Drive…"
-        defer {
-            busy = false
-            transferLabel = ""
-            transferProgress = 0
-            transferTotal = 0
-            transferBytes = 0
-            transferExpectedBytes = 0
-            transferSpeedBytesPerSecond = 0
+        guard file.isLocal else { return }
+        let id = transferCenter.enqueue(direction: .upload, name: file.displayName, size: Int64((try? file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)) { operationID, progress, phase in
+            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
+            try Task.checkCancellation()
+            phase("Подготовка миниатюры")
+            let thumb = try await Task.detached(priority: .utility) { try await self.makeEncryptedThumbnail(for: file.url) }.value
+            if let thumb { try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2") }
         }
-        do {
-            try await GoogleDriveStore.shared.uploadPlainFile(file.url, key: VDriveCrypto.localKey(), progress: { sent, total, speed in
-                self.transferBytes = sent
-                self.transferExpectedBytes = total
-                self.transferSpeedBytesPerSecond = speed
-            }, phase: { stage in
-                self.transferLabel = stage
-            })
-            transferProgress = 1
-            transferLabel = "Файл выгружен. Загружаю миниатюру…"
-            let thumb = try await Task.detached(priority: .utility) {
-                try await self.makeEncryptedThumbnail(for: file.url)
-            }.value
-            if let thumb {
-                try await GoogleDriveStore.shared.uploadAuxiliary(thumb, name: file.id + ".vthumb2")
-            }
-            transferProgress = 2
-            refreshFiles()
-            message = "Файл и миниатюра выгружены в Google Drive."
-        } catch { message = "Ошибка выгрузки: \(error.localizedDescription)" }
+        await transferCenter.wait(id); refreshFiles()
     }
 
     @MainActor private func downloadFile(_ file: VaultFile) async {
-        guard !busy else { message = "Дождись завершения текущей операции."; return }
         guard isConnected, cloudVaultUnlocked else { message = "Подключи и разблокируй Google Drive."; return }
         guard !file.isLocal, let driveID = GoogleDriveStore.shared.fileIDs[file.id] else { return }
-        busy = true
-        transferProgress = 0
-        transferTotal = 1
-        transferBytes = 0
-        transferExpectedBytes = 0
-        transferSpeedBytesPerSecond = 0
-        transferLabel = "Скачиваю файл с Google Drive…"
-        defer {
-            busy = false
-            transferLabel = ""
-            transferProgress = 0
-            transferTotal = 0
-            transferBytes = 0
-            transferExpectedBytes = 0
-            transferSpeedBytesPerSecond = 0
+        let id = transferCenter.enqueue(direction: .download, name: file.displayName) { operationID, progress, phase in
+            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: progress, phase: phase)
         }
-        do {
-            try await GoogleDriveStore.shared.downloadFile(driveID: driveID, name: file.id, to: documentsURL(), key: VDriveCrypto.localKey(), progress: { received, total, speed in
-                self.transferBytes = received
-                self.transferExpectedBytes = total
-                self.transferSpeedBytesPerSecond = speed
-            }, phase: { stage in
-                self.transferLabel = stage
-            })
-            transferProgress = 1
-            refreshFiles()
-            message = "Файл скачан на устройство."
-        } catch {
-            VDriveDiagnosticLog.shared.write("ERROR", "Скачивание \(file.id): \(error.localizedDescription)")
-            message = "Не удалось скачать файл: \(error.localizedDescription)"
-        }
+        await transferCenter.wait(id); refreshFiles()
     }
 
     @MainActor private func downloadAndOpen(_ file: VaultFile) async {
@@ -2407,6 +2299,15 @@ struct VDriveHomeView: View {
 
 /// Stream network transfers to disk and report actual byte counts.
 private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var sessions: [UUID: VDriveTransferSession] = [:]
+    private static var paused: Set<UUID> = []
+    private static var cancelled: Set<UUID> = []
+    static func pause(_ id: UUID) { lock.lock(); paused.insert(id); let value = sessions[id]; lock.unlock(); value?.activeTask?.suspend() }
+    static func resume(_ id: UUID) { lock.lock(); paused.remove(id); let value = sessions[id]; lock.unlock(); value?.activeTask?.resume() }
+    static func cancel(_ id: UUID) { lock.lock(); cancelled.insert(id); paused.remove(id); let value = sessions[id]; lock.unlock(); value?.activeTask?.cancel() }
+    private let transferID: UUID?
+    private var activeTask: URLSessionTask?
     private let progress: (Int64, Int64, Double) -> Void
     private var session: URLSession!
     private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
@@ -2419,12 +2320,14 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
     private var receivedDownloadBytes: Int64 = 0
     private var expectedDownloadBytes: Int64 = 0
 
-    init(progress: @escaping (Int64, Int64, Double) -> Void) {
+    init(progress: @escaping (Int64, Int64, Double) -> Void, transferID: UUID? = nil) {
         self.progress = progress
+        self.transferID = transferID
         super.init()
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
         session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue())
+        if let transferID { Self.lock.lock(); Self.sessions[transferID] = self; Self.lock.unlock() }
     }
 
     func download(_ request: URLRequest, expectedBytes: Int64 = 0) async throws -> (URL, URLResponse) {
@@ -2458,7 +2361,11 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
             lastDate = Date()
             lastReport = .distantPast
             let task: URLSessionTask = uploadFile.map { session.uploadTask(with: request, fromFile: $0) } ?? session.dataTask(with: request)
-            task.resume()
+            activeTask = task
+            if let transferID {
+                Self.lock.lock(); let stop = Self.cancelled.contains(transferID); let hold = Self.paused.contains(transferID); Self.lock.unlock()
+                if stop { task.cancel() } else if hold { task.suspend() } else { task.resume() }
+            } else { task.resume() }
         }
     }
 
@@ -2490,6 +2397,8 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let continuation else { return }
         self.continuation = nil
+        activeTask = nil
+        if let transferID { Self.lock.lock(); Self.sessions.removeValue(forKey: transferID); Self.paused.remove(transferID); Self.cancelled.remove(transferID); Self.lock.unlock() }
         if let error { continuation.resume(throwing: error); return }
         guard let response = task.response else { continuation.resume(throwing: DriveError.invalidResponse); return }
         continuation.resume(returning: (outputHandle == nil ? responseData : Data(), response))
@@ -2508,6 +2417,237 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
         let callback = progress
         let currentSpeed = speed
         DispatchQueue.main.async { callback(bytes, total, currentSpeed) }
+    }
+}
+
+
+// MARK: - VDrive Transfer Center
+private enum VDriveTransferDirection: String, Codable { case download, upload
+    var title: String { self == .download ? "Скачивание" : "Выгрузка" }
+    var symbol: String { self == .download ? "arrow.down.circle.fill" : "arrow.up.circle.fill" }
+}
+private enum VDriveTransferStatus: String, Codable { case queued, running, paused, completed, failed, cancelled, interrupted
+    var title: String { switch self { case .queued: return "В очереди"; case .running: return "Выполняется"; case .paused: return "Пауза"; case .completed: return "Завершено"; case .failed: return "Ошибка"; case .cancelled: return "Отменено"; case .interrupted: return "Прервано" } }
+    var terminal: Bool { self == .completed || self == .failed || self == .cancelled || self == .interrupted }
+}
+private struct VDriveTransferItem: Identifiable, Codable {
+    let id: UUID; let direction: VDriveTransferDirection; let fileName: String
+    var status: VDriveTransferStatus; var phase: String; var bytes: Int64; var total: Int64; var speed: Double; var error: String?
+    let created: Date
+    var progress: Double { total > 0 ? min(1, max(0, Double(bytes) / Double(total))) : 0 }
+}
+private struct VDriveTempItem: Identifiable {
+    let id: String; let url: URL; let bytes: Int64; let date: Date
+}
+@MainActor private final class VDriveTransferCenter: ObservableObject {
+    static let shared = VDriveTransferCenter()
+    @Published private(set) var items: [VDriveTransferItem] = []
+    @Published private(set) var temporary: [VDriveTempItem] = []
+    private struct Job {
+        let id: UUID
+        let work: (UUID, @escaping (Int64, Int64, Double) -> Void, @escaping (String) -> Void) async throws -> Void
+    }
+    private var queue: [Job] = []
+    private var jobs: [UUID: Job] = [:]
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var waiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    private var active: Set<UUID> = []
+    private var downloads = 0
+    private var uploads = 0
+    private let historyKey = "vdrive.transfer.history.v1"
+    private init() {
+        if let data = UserDefaults.standard.data(forKey: historyKey), let saved = try? JSONDecoder().decode([VDriveTransferItem].self, from: data) {
+            items = saved.map { old in var item = old; if !item.status.terminal { item.status = .interrupted; item.error = "Приложение завершилось до окончания операции." }; return item }
+            persist()
+        }
+        scanTemporary()
+    }
+    @discardableResult func enqueue(direction: VDriveTransferDirection, name: String, size: Int64 = 0,
+        work: @escaping (UUID, @escaping (Int64, Int64, Double) -> Void, @escaping (String) -> Void) async throws -> Void) -> UUID {
+        let id = UUID()
+        items.insert(VDriveTransferItem(id: id, direction: direction, fileName: name, status: .queued, phase: "Ожидает запуска", bytes: 0, total: size, speed: 0, error: nil, created: Date()), at: 0)
+        let job = Job(id: id, work: work); jobs[id] = job; queue.append(job); persist(); pump(); return id
+    }
+    func wait(_ id: UUID) async {
+        guard let item = items.first(where: { $0.id == id }), !item.status.terminal else { return }
+        await withCheckedContinuation { waiters[id, default: []].append($0) }
+    }
+    func pause(_ id: UUID) {
+        guard let i = items.firstIndex(where: { $0.id == id }), items[i].status == .running else { return }
+        items[i].status = .paused; items[i].phase = "Приостановлено"; items[i].speed = 0
+        freeSlot(id); VDriveTransferSession.pause(id); persist(); pump()
+    }
+    func resume(_ id: UUID) {
+        guard let item = items.first(where: { $0.id == id }), item.status == .paused else { return }
+        if tasks[id] == nil, let job = jobs[id] {
+            queue.append(job)
+            if let i = items.firstIndex(where: { $0.id == id }) { items[i].status = .queued }
+        }
+        pump()
+    }
+    func cancel(_ id: UUID) {
+        guard let item = items.first(where: { $0.id == id }), !item.status.terminal else { return }
+        queue.removeAll { $0.id == id }; freeSlot(id); VDriveTransferSession.cancel(id); tasks[id]?.cancel()
+        if tasks[id] == nil { finish(id, .cancelled, nil); jobs.removeValue(forKey: id) }
+        pump()
+    }
+    func retry(_ id: UUID) {
+        guard let old = items.first(where: { $0.id == id }), old.status == .failed, let job = jobs[id] else { return }
+        _ = enqueue(direction: old.direction, name: old.fileName, size: old.total, work: job.work)
+    }
+    func clearHistory() { items.removeAll { $0.status.terminal }; jobs = jobs.filter { id, _ in items.contains { $0.id == id } }; persist() }
+    func scanTemporary() {
+        let fm = FileManager.default; var found: [VDriveTempItem] = []
+        if let urls = try? fm.contentsOfDirectory(at: fm.temporaryDirectory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey]) {
+            for url in urls {
+                let n = url.lastPathComponent
+                guard n.hasPrefix("vdrive-download-") || n.hasPrefix("vdrive-upload-") || n.hasPrefix("VDrive-cloud-upload-") || n.hasSuffix(".vdrive-part") || n.hasSuffix(".body") else { continue }
+                let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey])
+                let date = v?.contentModificationDate ?? .distantPast
+                guard Date().timeIntervalSince(date) > 120 else { continue }
+                var size = Int64(v?.fileSize ?? 0)
+                if v?.isDirectory == true, let e = fm.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) {
+                    size = 0; for case let child as URL in e { size += Int64((try? child.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+                }
+                found.append(VDriveTempItem(id: url.path, url: url, bytes: size, date: date))
+            }
+        }
+        temporary = found.sorted { $0.date > $1.date }
+    }
+    func deleteTemporary(_ item: VDriveTempItem) throws {
+        guard temporary.contains(where: { $0.id == item.id }) else { return }
+        try FileManager.default.removeItem(at: item.url); scanTemporary()
+    }
+    private func canStart(_ d: VDriveTransferDirection) -> Bool { d == .download ? downloads < 2 : uploads < 1 }
+    private func takeSlot(_ id: UUID, _ d: VDriveTransferDirection) { guard active.insert(id).inserted else { return }; if d == .download { downloads += 1 } else { uploads += 1 } }
+    private func freeSlot(_ id: UUID) {
+        guard active.remove(id) != nil, let item = items.first(where: { $0.id == id }) else { return }
+        if item.direction == .download { downloads = max(0, downloads - 1) } else { uploads = max(0, uploads - 1) }
+    }
+    private func pump() {
+        for item in items where item.status == .paused && tasks[item.id] != nil && canStart(item.direction) {
+            if let i = items.firstIndex(where: { $0.id == item.id }) {
+                items[i].status = .running; items[i].phase = "Возобновление"
+                takeSlot(item.id, item.direction); VDriveTransferSession.resume(item.id)
+            }
+        }
+        while let p = queue.firstIndex(where: { j in items.first(where: { $0.id == j.id }).map { canStart($0.direction) } ?? false }) {
+            let job = queue.remove(at: p)
+            guard let item = items.first(where: { $0.id == job.id }) else { continue }
+            takeSlot(job.id, item.direction)
+            tasks[job.id] = Task { @MainActor [weak self] in await self?.execute(job) }
+        }
+        persist()
+    }
+    private func execute(_ job: Job) async {
+        if let i = items.firstIndex(where: { $0.id == job.id }) { items[i].status = .running; items[i].phase = "Подготовка" }; persist()
+        do {
+            try await job.work(job.id, { [weak self] b,t,s in Task { @MainActor in self?.update(job.id, bytes:b, total:t, speed:s) } },
+                               { [weak self] p in Task { @MainActor in self?.update(job.id, phase:p) } })
+            finish(job.id, .completed, nil)
+        } catch is CancellationError { finish(job.id, .cancelled, nil) }
+        catch { finish(job.id, .failed, error.localizedDescription) }
+        freeSlot(job.id); tasks.removeValue(forKey: job.id)
+        if items.first(where: { $0.id == job.id })?.status != .failed { jobs.removeValue(forKey: job.id) }
+        scanTemporary(); pump()
+    }
+    private func update(_ id: UUID, bytes: Int64? = nil, total: Int64? = nil, speed: Double? = nil, phase: String? = nil) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        if let bytes { items[i].bytes = bytes }; if let total, total > 0 { items[i].total = total }
+        if let speed { items[i].speed = speed }; if let phase { items[i].phase = phase }; persist()
+    }
+    private func finish(_ id: UUID, _ status: VDriveTransferStatus, _ error: String?) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].status = status; items[i].error = error; items[i].phase = status.title; items[i].speed = 0
+        (waiters.removeValue(forKey: id) ?? []).forEach { $0.resume() }; persist()
+    }
+    private func persist() { if let data = try? JSONEncoder().encode(Array(items.prefix(150))) { UserDefaults.standard.set(data, forKey: historyKey) } }
+}
+
+private struct VDriveControlCenterView: View {
+    @ObservedObject var center: VDriveTransferCenter
+    @Environment(\.dismiss) private var dismiss
+    @State private var deleting: VDriveTempItem?
+    @State private var confirmDelete = false
+    private var active: [VDriveTransferItem] { center.items.filter { !$0.status.terminal } }
+    private var history: [VDriveTransferItem] { center.items.filter { $0.status.terminal } }
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 10) {
+                        stat("Активно", active.filter { $0.status == .running }.count, "arrow.triangle.2.circlepath")
+                        stat("Очередь", active.filter { $0.status == .queued }.count, "clock")
+                        stat("Пауза", active.filter { $0.status == .paused }.count, "pause.circle")
+                    }
+                    if !active.isEmpty {
+                        HStack {
+                            Text("Передачи").font(.headline); Spacer()
+                            Button("Пауза всё") { active.filter { $0.status == .running }.forEach { center.pause($0.id) } }
+                            Button("Старт всё") { active.filter { $0.status == .paused }.forEach { center.resume($0.id) } }
+                        }
+                        Text("Лимит: 2 скачивания и 1 выгрузка одновременно").font(.caption).foregroundStyle(.secondary)
+                        ForEach(active) { item in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Image(systemName: item.direction.symbol)
+                                    VStack(alignment: .leading, spacing: 2) { Text(item.fileName).font(.subheadline.weight(.semibold)).lineLimit(1); Text(item.phase).font(.caption).foregroundStyle(.secondary) }
+                                    Spacer(); Text(item.status.title).font(.caption.weight(.medium))
+                                }
+                                ProgressView(value: item.progress).tint(item.direction == .download ? .blue : .green)
+                                HStack {
+                                    Text(item.total > 0 ? "\(ByteCountFormatter.string(fromByteCount: item.bytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: item.total, countStyle: .file))" : "Подготовка")
+                                    Spacer(); Text(item.speed > 0 ? String(format: "%.2f MB/s", item.speed / 1_000_000) : "— MB/s")
+                                }.font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                HStack {
+                                    Spacer()
+                                    if item.status == .running { Button("Пауза", systemImage: "pause.fill") { center.pause(item.id) }.buttonStyle(.bordered) }
+                                    if item.status == .paused { Button("Продолжить", systemImage: "play.fill") { center.resume(item.id) }.buttonStyle(.borderedProminent) }
+                                    Button(role: .destructive) { center.cancel(item.id) } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.bordered)
+                                }
+                            }.padding(12).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 15))
+                        }
+                    } else { ContentUnavailableView("Нет активных передач", systemImage: "arrow.left.arrow.right") }
+                    HStack { Text("Временные файлы").font(.headline); Spacer(); Button("Сканировать", systemImage: "arrow.clockwise") { center.scanTemporary() }.font(.caption) }
+                    Text("Остатки операций старше 2 минут.").font(.caption).foregroundStyle(.secondary)
+                    if center.temporary.isEmpty { Text("Незавершённых временных файлов не найдено.").font(.subheadline).foregroundStyle(.secondary) }
+                    ForEach(center.temporary) { file in
+                        HStack {
+                            Image(systemName: "doc.zipper").foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(file.url.lastPathComponent).font(.caption.weight(.medium)).lineLimit(1)
+                                Text("\(ByteCountFormatter.string(fromByteCount: file.bytes, countStyle: .file)) · \(file.date.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(role: .destructive) { deleting = file; confirmDelete = true } label: { Image(systemName: "trash") }.buttonStyle(.bordered)
+                        }.padding(10).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                    if !history.isEmpty {
+                        Text("История").font(.headline)
+                        ForEach(history.prefix(25)) { item in
+                            HStack {
+                                Image(systemName: item.direction.symbol).foregroundStyle(item.status == .completed ? .green : item.status == .failed ? .red : .secondary)
+                                VStack(alignment: .leading, spacing: 2) { Text(item.fileName).font(.caption.weight(.medium)); Text(item.error ?? item.status.title).font(.caption2).foregroundStyle(.secondary).lineLimit(2) }
+                                Spacer()
+                                if item.status == .failed { Button("Повторить") { center.retry(item.id) }.font(.caption) }
+                            }.padding(.vertical, 3)
+                        }
+                        Button("Очистить историю", role: .destructive) { center.clearHistory() }.font(.caption)
+                    }
+                }.padding(16)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("VDrive Control Center").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Готово") { dismiss() } } }
+            .confirmationDialog("Удалить временный файл?", isPresented: $confirmDelete, titleVisibility: .visible) {
+                Button("Удалить", role: .destructive) { if let deleting { try? center.deleteTemporary(deleting) }; deleting = nil }
+                Button("Отмена", role: .cancel) { deleting = nil }
+            } message: { Text("Удаляется только выбранный устаревший временный объект. Оригиналы сейфа не затрагиваются.") }
+        }
+    }
+    private func stat(_ title: String, _ value: Int, _ icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) { Image(systemName: icon).foregroundStyle(.secondary); Text("\(value)").font(.title2.bold()).monospacedDigit(); Text(title).font(.caption).foregroundStyle(.secondary) }
+            .frame(maxWidth: .infinity, alignment: .leading).padding(11).background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -2750,7 +2890,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         }
     }
 
-    func uploadPlainFile(_ plaintextFile: URL, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }, phase: @escaping (String) -> Void = { _ in }) async throws {
+    func uploadPlainFile(_ plaintextFile: URL, key: SymmetricKey, transferID: UUID? = nil, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }, phase: @escaping (String) -> Void = { _ in }) async throws {
         let stagingDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("VDrive-cloud-upload-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
@@ -2764,7 +2904,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             }
         }.value
         await MainActor.run { phase("Выгрузка зашифрованного файла в Google Drive"); progress(0, originalSize, 0) }
-        try await upload(encryptedFile) { sent, total, speed in
+        try Task.checkCancellation()
+        try await upload(encryptedFile, transferID: transferID) { sent, total, speed in
             guard total > 0, originalSize > 0 else {
                 progress(sent, originalSize, speed)
                 return
@@ -2778,7 +2919,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         fileIDs = map
     }
 
-    func upload(_ file: URL, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
+    func upload(_ file: URL, transferID: UUID? = nil, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }) async throws {
         try await ensureAccessToken()
         // Assemble multipart body on disk; do not duplicate large encrypted videos in RAM.
         let boundary = "vdrive-\(UUID().uuidString)"
@@ -2803,7 +2944,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         request.httpMethod = "POST"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/related; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let transfer = VDriveTransferSession(progress: progress)
+        let transfer = VDriveTransferSession(progress: progress, transferID: transferID)
         let (responseData, response) = try await transfer.upload(request, file: bodyURL)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw DriveError.server(String(data: responseData, encoding: .utf8) ?? "Upload error")
@@ -2876,7 +3017,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         return remote
     }
 
-    func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }, phase: @escaping (String) -> Void = { _ in }) async throws {
+    func downloadFile(driveID: String, name: String, to directory: URL, key: SymmetricKey, transferID: UUID? = nil, progress: @escaping (Int64, Int64, Double) -> Void = { _, _, _ in }, phase: @escaping (String) -> Void = { _ in }) async throws {
         let started = Date()
         VDriveDiagnosticLog.shared.write("DOWNLOAD", "Начало; driveID=\(driveID.prefix(8)); extension=\((name as NSString).pathExtension)")
         guard beginDownload(driveID) else {
@@ -2915,7 +3056,8 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/" + driveID + "?alt=media")!)
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
         await MainActor.run { phase("Скачивание зашифрованного файла из Google Drive"); progress(0, remoteSize, 0) }
-        let transfer = VDriveTransferSession(progress: progress)
+        try Task.checkCancellation()
+        let transfer = VDriveTransferSession(progress: progress, transferID: transferID)
         let (downloadedURL, response) = try await transfer.download(request, expectedBytes: remoteSize)
         let downloadedBytes = (try? downloadedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
