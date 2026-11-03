@@ -2050,37 +2050,25 @@ struct VDriveHomeView: View {
 
     @MainActor private func downloadMissing() async {
         guard !busy else { message = "Дождись завершения текущей операции."; return }
-        VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
         guard isConnected else { showGoogleSetupInfo = true; return }
         guard cloudVaultUnlocked else { message = "Сначала разблокируй облачное хранилище кодом восстановления."; return }
-        busy = true
-        transferProgress = 0
-        transferTotal = 0
-        transferLabel = "Получаю список файлов Google Drive…"
-        defer {
-            busy = false
-            transferLabel = ""
-            transferProgress = 0
-            transferTotal = 0
-        }
-        transferBytes = 0
-        transferExpectedBytes = 0
-        transferSpeedBytesPerSecond = 0
+        VDriveDiagnosticLog.shared.write("SYNC", "Начата массовая загрузка отсутствующих файлов")
         do {
             let localNames = Set(files.filter { $0.isLocal }.map { $0.id })
-            let count = try await GoogleDriveStore.shared.downloadMissing(to: documentsURL(), localNames: localNames, key: VDriveCrypto.localKey(), progress: { received, total, speed in
-                self.transferBytes = received
-                self.transferExpectedBytes = total
-                self.transferSpeedBytesPerSecond = speed
-            }, phase: { stage in
-                self.transferLabel = stage
-            })
-            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(count)")
-            transferProgress = count
-            transferTotal = max(count, 1)
-            transferLabel = "Загрузка из Google Drive завершена"
+            let remote = try await GoogleDriveStore.shared.listVaultMedia()
+            let pending = remote.filter { $0.name.hasSuffix(".vdrive") && !localNames.contains($0.name) }
+            let ids = pending.map { item in
+                let displayName = VaultFile(id: item.name, url: documentsURL().appendingPathComponent(item.name)).displayName
+                return transferCenter.enqueue(direction: .download, name: displayName, size: Int64(item.size ?? "") ?? 0) { operationID, callbacks in
+                    try Task.checkCancellation()
+                    try await GoogleDriveStore.shared.downloadFile(driveID: item.id, name: item.name, to: documentsURL(), key: VDriveCrypto.localKey(), transferID: operationID, progress: callbacks.progress, phase: callbacks.phase)
+                }
+            }
+            for id in ids { await transferCenter.wait(id) }
+            await refreshCloudInventory()
             refreshFiles()
-            message = count == 0 ? "Все облачные файлы уже на устройстве." : "Скачано с Google Drive: \(count)"
+            VDriveDiagnosticLog.shared.write("SYNC", "Массовая загрузка завершена; files=\(pending.count)")
+            message = pending.isEmpty ? "Все облачные файлы уже на устройстве." : "Поставлено на скачивание: \(pending.count). Результаты — в Control Center."
         } catch {
             VDriveDiagnosticLog.shared.write("ERROR", "Массовое скачивание: \(error.localizedDescription)")
             message = "Ошибка скачивания: \(error.localizedDescription)"
@@ -2281,6 +2269,7 @@ private final class VDriveTransferSession: NSObject, URLSessionDataDelegate, URL
     static func pause(_ id: UUID) { lock.lock(); paused.insert(id); let value = sessions[id]; lock.unlock(); value?.activeTask?.suspend() }
     static func resume(_ id: UUID) { lock.lock(); paused.remove(id); let value = sessions[id]; lock.unlock(); value?.activeTask?.resume() }
     static func cancel(_ id: UUID) { lock.lock(); cancelled.insert(id); paused.remove(id); let value = sessions[id]; lock.unlock(); value?.activeTask?.cancel() }
+    static func forget(_ id: UUID) { lock.lock(); paused.remove(id); cancelled.remove(id); lock.unlock() }
     private let transferID: UUID?
     private var activeTask: URLSessionTask?
     private let progress: (Int64, Int64, Double) -> Void
@@ -2476,6 +2465,7 @@ private typealias VDriveTransferWork = (UUID, VDriveTransferCallbacks) async thr
     }
     func clearHistory() { items.removeAll { $0.status.terminal }; jobs = jobs.filter { id, _ in items.contains { $0.id == id } }; persist() }
     func scanTemporary() {
+        if items.contains(where: { !$0.status.terminal }) { temporary = []; return }
         let fm = FileManager.default; var found: [VDriveTempItem] = []
         if let urls = try? fm.contentsOfDirectory(at: fm.temporaryDirectory, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey]) {
             for url in urls {
@@ -2543,6 +2533,7 @@ private typealias VDriveTransferWork = (UUID, VDriveTransferCallbacks) async thr
     }
     private func finish(_ id: UUID, _ status: VDriveTransferStatus, _ error: String?) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        VDriveTransferSession.forget(id)
         items[i].status = status; items[i].error = error; items[i].phase = status.title; items[i].speed = 0
         (waiters.removeValue(forKey: id) ?? []).forEach { $0.resume() }; persist()
     }
