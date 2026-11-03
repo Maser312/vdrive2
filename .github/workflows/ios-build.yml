@@ -1,0 +1,51 @@
+name: iOS build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Xcode project is present
+        run: |
+          find . -maxdepth 4 \( -name '*.xcodeproj' -o -name '*.xcworkspace' \) -print -quit | grep -q . || {
+            echo "No Xcode project found."
+            exit 1
+          }
+
+      - name: Build for iPhone (unsigned)
+        run: |
+          PROJECT=$(find . -maxdepth 4 -name '*.xcodeproj' -print -quit)
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme VDrive \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/VDrive.app"
+          test -d "$APP" || { echo "VDrive.app was not produced"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/VDrive.app"
+          cd "$RUNNER_TEMP/ipa"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/VDrive-unsigned.ipa" Payload
+          test -s "$GITHUB_WORKSPACE/VDrive-unsigned.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VDrive-unsigned-IPA
+          path: VDrive-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+# Build trigger refresh: 2026-11-03

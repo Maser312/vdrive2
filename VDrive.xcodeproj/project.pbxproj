@@ -1,0 +1,36 @@
+// !$*UTF8*$!
+{
+ archiveVersion = 1;
+ classes = {};
+ objectVersion = 60;
+ objects = {
+  A10000000000000000000001 = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 1600;}; buildConfigurationList = A10000000000000000000020; compatibilityVersion = "Xcode 15.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A10000000000000000000002; packageReferences = (A10000000000000000000030,); productRefGroup = A10000000000000000000003; projectDirPath = ""; projectRoot = ""; targets = (A10000000000000000000010,);};
+  A10000000000000000000002 = {isa = PBXGroup; children = (A10000000000000000000004,A10000000000000000000005,A10000000000000000000006,A10000000000000000000003,); sourceTree = "<group>";};
+  A10000000000000000000003 = {isa = PBXGroup; children = (A10000000000000000000007,); name = Products; sourceTree = "<group>";};
+  A10000000000000000000004 = {isa = PBXGroup; children = (A10000000000000000000008,A10000000000000000000009,); name = App; path = VDrive/App; sourceTree = "<group>";};
+  A10000000000000000000005 = {isa = PBXGroup; children = (A1000000000000000000000A,); name = Security; path = VDrive/Security; sourceTree = "<group>";};
+  A10000000000000000000006 = {isa = PBXGroup; children = (A1000000000000000000000B,); name = "Supporting Files"; path = VDrive/App; sourceTree = "<group>";};
+  A10000000000000000000007 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VDrive.app; sourceTree = BUILT_PRODUCTS_DIR;};
+  A10000000000000000000008 = {isa = PBXFileReference; lastKnownFileType = swift; path = VDriveApp.swift; sourceTree = "<group>";};
+  A10000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = swift; path = VDriveHomeView.swift; sourceTree = "<group>";};
+  A1000000000000000000000A = {isa = PBXFileReference; lastKnownFileType = swift; path = VDriveCrypto.swift; sourceTree = "<group>";};
+  A1000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>";};
+  A10000000000000000000011 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000012,A10000000000000000000013,A10000000000000000000014,); runOnlyForDeploymentPostprocessing = 0;};
+  A10000000000000000000012 = {isa = PBXBuildFile; fileRef = A10000000000000000000008;};
+  A10000000000000000000013 = {isa = PBXBuildFile; fileRef = A10000000000000000000009;};
+  A10000000000000000000014 = {isa = PBXBuildFile; fileRef = A1000000000000000000000A;};
+  A10000000000000000000015 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000016,); runOnlyForDeploymentPostprocessing = 0;};
+  A10000000000000000000016 = {isa = PBXBuildFile; productRef = A10000000000000000000031;};
+  A10000000000000000000017 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;};
+  A10000000000000000000010 = {isa = PBXNativeTarget; buildConfigurationList = A10000000000000000000021; buildPhases = (A10000000000000000000011,A10000000000000000000015,A10000000000000000000017,); buildRules = (); dependencies = (); name = VDrive; packageProductDependencies = (A10000000000000000000031,); productName = VDrive; productReference = A10000000000000000000007; productType = "com.apple.product-type.application";};
+  A10000000000000000000020 = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000022,A10000000000000000000023,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+  A10000000000000000000021 = {isa = XCConfigurationList; buildConfigurations = (A10000000000000000000024,A10000000000000000000025,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+  A10000000000000000000022 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; IPHONEOS_DEPLOYMENT_TARGET = 26.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0;}; name = Debug;};
+  A10000000000000000000023 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; IPHONEOS_DEPLOYMENT_TARGET = 26.0; SDKROOT = iphoneos; SWIFT_VERSION = 5.0;}; name = Release;};
+  A10000000000000000000024 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VDrive/App/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = app.vdrive.privatevault; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = "1,2"; IPHONEOS_DEPLOYMENT_TARGET = 26.0; SWIFT_VERSION = 5.0; SDKROOT = iphoneos;}; name = Debug;};
+  A10000000000000000000025 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = VDrive/App/Info.plist; PRODUCT_BUNDLE_IDENTIFIER = app.vdrive.privatevault; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = YES; TARGETED_DEVICE_FAMILY = "1,2"; IPHONEOS_DEPLOYMENT_TARGET = 26.0; SWIFT_VERSION = 5.0; SDKROOT = iphoneos;}; name = Release;};
+  A10000000000000000000030 = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/Jakubantalik/Libraries.dev"; requirement = {branch = main; kind = branch;};};
+  A10000000000000000000031 = {isa = XCSwiftPackageProductDependency; package = A10000000000000000000030; productName = MetalFxKit;};
+ };
+ rootObject = A10000000000000000000001;
+}
