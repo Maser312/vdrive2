@@ -483,6 +483,9 @@ struct VDriveHomeView: View {
     @State private var selectionMode = false
     @State private var showBulkDeleteConfirmation = false
     @State private var bulkDeleteMode = "local"
+    @State private var showSingleDeleteConfirmation = false
+    @State private var pendingDeleteFile: VaultFile?
+    @State private var pendingDeleteMode = "local"
     @State private var message = "Личное хранилище"
     @State private var busy = false
     @State private var transferProgress = 0
@@ -1035,11 +1038,11 @@ struct VDriveHomeView: View {
                                         if file.isLocal && !file.uploaded {
                                             Button("Выгрузить в Google Drive", systemImage: "icloud.and.arrow.up") { Task { await uploadFile(file) } }
                                                 .disabled(!isConnected || !cloudVaultUnlocked)
-                                            Button("Удалить с устройства", systemImage: "trash", role: .destructive) { deleteLocal(file) }
+                                            Button("Удалить с устройства", systemImage: "trash", role: .destructive) { requestDelete(file, mode: "local") }
                                         } else if file.isLocal && file.uploaded {
-                                            Button("Удалить с устройства", systemImage: "iphone", role: .destructive) { deleteLocal(file) }
-                                            Button("Удалить из Google Drive", systemImage: "icloud", role: .destructive) { Task { await deleteCloud(file) } }
-                                            Button("Удалить везде", systemImage: "trash", role: .destructive) { Task { await deleteEverywhere(file) } }
+                                            Button("Удалить с устройства", systemImage: "iphone", role: .destructive) { requestDelete(file, mode: "local") }
+                                            Button("Удалить из Google Drive", systemImage: "icloud", role: .destructive) { requestDelete(file, mode: "cloud") }
+                                            Button("Удалить везде", systemImage: "trash", role: .destructive) { requestDelete(file, mode: "all") }
                                         } else {
                                             Button("Скачать на устройство", systemImage: "icloud.and.arrow.down") { Task { await downloadFile(file) } }
                                                 .disabled(!isConnected || !cloudVaultUnlocked || busy)
@@ -1175,11 +1178,24 @@ struct VDriveHomeView: View {
             }
             .background(Color(uiColor: .systemBackground).ignoresSafeArea())
             .toolbar(.hidden, for: .navigationBar)
-            .confirmationDialog("Удалить (selectedFileIDs.count) выбранных файлов?", isPresented: $showBulkDeleteConfirmation, titleVisibility: .visible) {
+            .confirmationDialog("Удалить выбранные файлы?", isPresented: $showBulkDeleteConfirmation, titleVisibility: .visible) {
                 Button("Удалить", role: .destructive) { Task { await bulkDeleteSelected() } }
                 Button("Отмена", role: .cancel) {}
             } message: {
-                Text(bulkDeleteMode == "local" ? "Удалятся только копии на этом устройстве." : bulkDeleteMode == "cloud" ? "Удалятся только копии из Google Drive." : "Файлы будут удалены и с устройства, и из Google Drive.")
+                Text("Будет удалено: \\(selectedFileIDs.count) файлов. " + (bulkDeleteMode == "local" ? "Только копии на этом устройстве." : bulkDeleteMode == "cloud" ? "Только копии из Google Drive." : "Копии и на устройстве, и в Google Drive. Это действие нельзя отменить."))
+            }
+            .confirmationDialog("Подтвердить удаление?", isPresented: $showSingleDeleteConfirmation, titleVisibility: .visible) {
+                Button("Удалить", role: .destructive) {
+                    guard let file = pendingDeleteFile else { return }
+                    let mode = pendingDeleteMode
+                    pendingDeleteFile = nil
+                    if mode == "local" { deleteLocal(file) }
+                    else if mode == "cloud" { Task { await deleteCloud(file) } }
+                    else { Task { await deleteEverywhere(file) } }
+                }
+                Button("Отмена", role: .cancel) { pendingDeleteFile = nil }
+            } message: {
+                Text(singleDeleteDescription)
             }
         }
     }
@@ -1986,6 +2002,24 @@ struct VDriveHomeView: View {
         guard file.isLocal || FileManager.default.fileExists(atPath: file.url.path) else { return }
         refreshFiles()
         if let local = files.first(where: { $0.id == file.id }) { openPreview(local) }
+    }
+
+    private var singleDeleteDescription: String {
+        guard let file = pendingDeleteFile else { return "Файл не будет удалён." }
+        switch pendingDeleteMode {
+        case "local":
+            return "«\\(file.displayName)» будет удалён только с этого устройства. Облачная копия останется, если она есть."
+        case "cloud":
+            return "«\\(file.displayName)» и его облачные миниатюры будут удалены из Google Drive. Локальная копия останется, если она есть."
+        default:
+            return "«\\(file.displayName)» будет удалён и с устройства, и из Google Drive вместе с облачными миниатюрами. Восстановить его через VDrive будет нельзя."
+        }
+    }
+
+    private func requestDelete(_ file: VaultFile, mode: String) {
+        pendingDeleteFile = file
+        pendingDeleteMode = mode
+        showSingleDeleteConfirmation = true
     }
 
     private func deleteLocal(_ file: VaultFile) {
