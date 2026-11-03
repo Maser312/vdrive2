@@ -3132,7 +3132,7 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
             guard !FileManager.default.fileExists(atPath: destination.path) else { existingNames.insert(item.name); continue }
             VDriveDiagnosticLog.shared.write("SYNC", "Очередь: \(item.name); cloudBytes=\(item.size ?? "unknown")")
             phase("Файл \(count + 1) из \(pending.count): \(item.name)")
-            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: callbacks.progress, phase: callbacks.phase)
+            try await downloadFile(driveID: item.id, name: item.name, to: directory, key: key, progress: progress, phase: phase)
             existingNames.insert(item.name)
             count += 1
             VDriveDiagnosticLog.shared.write("SYNC", "Завершён файл \(item.name); \(count)/\(pending.count)")
