@@ -189,7 +189,7 @@ private struct VaultThumbnail: View {
         .clipped()
         // Load each visible lazy-grid cell once. Privacy blur is a visual
         // overlay only; toggling it must not restart thumbnail decryption.
-        .task(id: file.id) {
+        .task(id: "(file.id)-(file.isLocal)") {
             await loadThumbnail()
         }
     }
@@ -1260,7 +1260,10 @@ struct VDriveHomeView: View {
         do {
             for file in targets {
                 if bulkDeleteMode == "local" {
-                    if file.isLocal { try FileManager.default.removeItem(at: file.url) }
+                    if file.isLocal {
+                        try FileManager.default.removeItem(at: file.url)
+                        if !file.uploaded { VaultThumbnail.removeLocalThumbnail(for: file.id) }
+                    }
                 } else if bulkDeleteMode == "cloud" {
                     if file.uploaded { try await GoogleDriveStore.shared.delete(id: file.id) }
                 } else {
@@ -2027,7 +2030,9 @@ struct VDriveHomeView: View {
             guard file.isLocal else { message = "Файл хранится только в Google Drive."; return }
             try FileManager.default.removeItem(at: file.url)
             VDriveCrypto.unmarkLocalPlaintextFile(file.url)
-            VaultThumbnail.removeLocalThumbnail(for: file.id)
+            // Keep the cached preview when the cloud original still exists.
+            // A local-only delete must not remove the cloud item's thumbnail.
+            if !file.uploaded { VaultThumbnail.removeLocalThumbnail(for: file.id) }
             refreshFiles()
             message = file.uploaded ? "Удалено с устройства. Копия в Google Drive сохранена." : "Файл удалён с устройства."
         } catch { message = "Ошибка удаления: \(error.localizedDescription)" }
