@@ -155,10 +155,11 @@ private struct VaultThumbnail: View {
     let file: VaultFile
     @State private var image: UIImage?
     @State private var loadFailed = false
+    @State private var didAttemptCloudThumbnailRepair = false
 
     private var isVideo: Bool {
         let ext = (file.displayName as NSString).pathExtension.lowercased()
-        return ["mov", "mp4", "m4v", "avi", "mkv"].contains(ext)
+        return ["mov", "mp4", "m4v", "avi", "mkv", "3gp", "3g2"].contains(ext)
     }
 
     var body: some View {
@@ -202,6 +203,7 @@ private struct VaultThumbnail: View {
         if let cachedPreview = try? Data(contentsOf: cacheURL, options: [.mappedIfSafe]) {
             if let cachedImage = UIImage(data: cachedPreview) {
                 image = cachedImage
+                await repairCloudThumbnailIfNeeded(jpeg: cachedPreview)
                 return
             }
             if let keyData = VDriveCrypto.existingLocalKeyData() {
@@ -211,7 +213,10 @@ private struct VaultThumbnail: View {
                         try await ThumbnailCryptoQueue.shared.decrypt(cachedPreview, key: key)
                     }.value
                     image = UIImage(data: jpeg)
-                    if image != nil { return }
+                    if image != nil {
+                        await repairCloudThumbnailIfNeeded(jpeg: jpeg)
+                        return
+                    }
                 } catch { }
             }
         }
@@ -235,6 +240,7 @@ private struct VaultThumbnail: View {
                     try Self.saveLocalThumbnail(jpeg, for: file.id)
                 }.value
                 image = UIImage(data: jpeg)
+                await repairCloudThumbnailIfNeeded(jpeg: jpeg)
             }
             loadFailed = image == nil
             return
@@ -245,6 +251,19 @@ private struct VaultThumbnail: View {
             loadFailed = image == nil
         } catch {
             loadFailed = true
+        }
+    }
+
+    @MainActor private func repairCloudThumbnailIfNeeded(jpeg: Data) async {
+        guard isVideo, file.isLocal, file.uploaded, !didAttemptCloudThumbnailRepair else { return }
+        didAttemptCloudThumbnailRepair = true
+        do {
+            let encrypted = try await Task.detached(priority: .utility) {
+                try VDriveCrypto.seal(jpeg, key: VDriveCrypto.localKey())
+            }.value
+            try await GoogleDriveStore.shared.uploadAuxiliaryIfMissing(encrypted, name: file.id + ".vthumb2")
+        } catch {
+            VDriveDiagnosticLog.shared.write("THUMB", "Cloud preview repair failed for \(file.id): \(error.localizedDescription)")
         }
     }
 
@@ -2968,6 +2987,25 @@ private final class GoogleDriveStore: NSObject, ASWebAuthenticationPresentationC
         var map = fileIDs
         map[file.lastPathComponent] = uploaded.id
         fileIDs = map
+    }
+
+    func uploadAuxiliaryIfMissing(_ data: Data, name: String) async throws {
+        try await ensureAccessToken()
+        var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+        components.queryItems = [
+            URLQueryItem(name: "pageSize", value: "1"),
+            URLQueryItem(name: "q", value: "name = '\(name)' and trashed = false"),
+            URLQueryItem(name: "fields", value: "files(id,name)")
+        ]
+        var lookup = URLRequest(url: components.url!)
+        lookup.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
+        let (lookupData, lookupResponse) = try await URLSession.shared.data(for: lookup)
+        guard let lookupHTTP = lookupResponse as? HTTPURLResponse, (200..<300).contains(lookupHTTP.statusCode) else {
+            throw DriveError.server(String(data: lookupData, encoding: .utf8) ?? "Не удалось проверить облачную миниатюру")
+        }
+        let existing = try JSONDecoder().decode(DriveFileList.self, from: lookupData).files.first
+        guard existing == nil else { return }
+        try await uploadAuxiliary(data, name: name)
     }
 
     func uploadAuxiliary(_ data: Data, name: String) async throws {
