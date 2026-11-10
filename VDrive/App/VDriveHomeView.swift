@@ -189,7 +189,7 @@ private struct VaultThumbnail: View {
         .clipped()
         // Load each visible lazy-grid cell once. Privacy blur is a visual
         // overlay only; toggling it must not restart thumbnail decryption.
-        .task(id: "(file.id)-(file.isLocal)") {
+        .task(id: "\(file.id)-\(file.isLocal)") {
             await loadThumbnail()
         }
     }
